@@ -1,5 +1,3 @@
-# Call-Notes-Transcriber-Organizer
-
 # Call Notes — Live Transcriber & Note Generator
 
 A Windows desktop application that live-transcribes any call (Microsoft Teams, Zoom, or any platform) and generates comprehensive, organized notes using Claude on Amazon Bedrock. Notes are saved as `.docx` files organized by customer.
