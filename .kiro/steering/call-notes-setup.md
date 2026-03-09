@@ -32,7 +32,7 @@ They need an IAM user with an access key. The "Local code" use case should be se
 
 Verify credentials work: `aws sts get-caller-identity`
 
-They also need to enable Claude model access in the Bedrock console for their region.
+They should verify Claude model access is available in the Bedrock console for their region.
 
 ## 4. Update config.py
 

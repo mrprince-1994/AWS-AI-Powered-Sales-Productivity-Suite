@@ -62,12 +62,12 @@ Verify with:
 aws sts get-caller-identity
 ```
 
-### 2. Enable Bedrock Model Access
+### 2. Verify Bedrock Model Access
 
 1. Go to the [Bedrock console](https://console.aws.amazon.com/bedrock/)
 2. Select your region (default: `us-east-1`)
 3. Navigate to **Model access** in the left sidebar
-4. Request access to **Anthropic Claude** models
+4. Verify that **Anthropic Claude** models show as available
 
 ---
 
@@ -178,6 +178,6 @@ call_notes_app/
 | `ModuleNotFoundError` | Run `python -m pip install -r requirements.txt` (use `python -m pip` to ensure correct Python) |
 | No transcript appearing | Check Windows output is set to CABLE Input; verify audio device selection in app |
 | Transcript only shows when audio pauses | This was fixed — make sure you're running the latest version of `transcriber.py` |
-| Bedrock `AccessDeniedException` | Enable Claude model access in Bedrock console and verify IAM permissions |
+| Bedrock `AccessDeniedException` | Verify Claude models are available in Bedrock console and check IAM permissions |
 | Transcribe `InvalidClientTokenId` | Re-run `aws configure` with valid credentials |
 | App doesn't capture mic audio | Select the correct mic in the Microphone dropdown; both streams are mixed together |

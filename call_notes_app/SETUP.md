@@ -127,16 +127,16 @@ You should see your account ID and user ARN.
 
 ---
 
-## Step 8: Enable Claude Model Access in Bedrock
+## Step 8: Verify Bedrock Model Access
+
+Claude models on Bedrock are available by default — no access request needed.
 
 1. Go to the Bedrock console: https://console.aws.amazon.com/bedrock/
 2. Make sure you're in the same region you configured (e.g., `us-east-1`)
 3. Click **Model access** in the left sidebar
-4. Find **Anthropic** → **Claude** models
-5. Click **Request model access** (or **Manage model access**)
-6. Enable access to Claude Sonnet and save
+4. Verify that **Anthropic Claude** models show as available
 
-This can take a few minutes to activate.
+If you run into an access error when generating notes, check that your IAM user has the `AmazonBedrockFullAccess` policy attached.
 
 ---
 
@@ -267,7 +267,7 @@ If you're using Kiro as your IDE, you can get guided setup assistance:
 | `python` not recognized | Reinstall Python with "Add to PATH" checked, or use the full path to python.exe |
 | `ModuleNotFoundError` | Run `python -m pip install -r requirements.txt` from the `call_notes_app` folder |
 | `InvalidClientTokenId` from AWS | Re-run `aws configure` with valid credentials |
-| Bedrock `AccessDeniedException` | Enable Claude model access in the Bedrock console (Step 8) |
+| Bedrock `AccessDeniedException` | Verify Claude models are available in the Bedrock console (Step 8) |
 | No transcript appearing | Verify Windows output is set to CABLE Input (Step 11) |
 | Can't hear audio after setting up VB-CABLE | Set up listen-through in mmsys.cpl (Step 11) |
 | Audio stopped after plugging in headset | Windows auto-switched output — set it back to CABLE Input |
