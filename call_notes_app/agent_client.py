@@ -35,7 +35,12 @@ from memory alone. For EVERY question:
 If tools are unavailable, clearly state you are answering from general knowledge.
 
 Keep answers to 2-4 paragraphs. Include specific details: features, pricing, integrations.
-Format in clean markdown with bullet points where helpful."""
+Format in clean markdown with bullet points where helpful.
+
+ALWAYS end your answer with a "📎 Sources" section containing markdown links to the
+documentation pages you used. Use the exact URLs from your search/read tool results.
+Format: `- [Page Title](https://docs.aws.amazon.com/...)`. Include at least one link.
+If no tools were available, link to the most relevant AWS service page instead."""
 
 _IS_WINDOWS = sys.platform == "win32"
 _EXE_SUFFIX = ".exe" if _IS_WINDOWS else ""
@@ -120,6 +125,30 @@ class _MCPPool:
             startup_timeout=90,
         )
 
+        aws_pricing_mcp = MCPClient(
+            transport_callable=lambda: stdio_client(
+                StdioServerParameters(
+                    command=uvx_path,
+                    args=[
+                        "--from",
+                        "awslabs.aws-pricing-mcp-server@latest",
+                        f"awslabs.aws-pricing-mcp-server{_EXE_SUFFIX}",
+                    ],
+                    env={**os.environ, "FASTMCP_LOG_LEVEL": "ERROR"},
+                )
+            ),
+            tool_filters={
+                "allowed": [
+                    "get_pricing",
+                    "get_pricing_service_codes",
+                    "get_pricing_service_attributes",
+                    "get_pricing_attribute_values",
+                ]
+            },
+            prefix="pricing",
+            startup_timeout=90,
+        )
+
         aws_knowledge_mcp = None
         try:
             from mcp.client.streamable_http import streamablehttp_client
@@ -156,6 +185,7 @@ class _MCPPool:
 
         threads = []
         threads.append(threading.Thread(target=_start_client, args=("aws-docs", aws_docs_mcp)))
+        threads.append(threading.Thread(target=_start_client, args=("aws-pricing", aws_pricing_mcp)))
         if aws_knowledge_mcp:
             threads.append(threading.Thread(target=_start_client, args=("aws-knowledge", aws_knowledge_mcp)))
 
@@ -339,7 +369,15 @@ def ask_agent(question: str, callback=None, on_chunk=None):
     def _run():
         try:
             if AGENTCORE_RUNTIME_ARN:
-                answer = _invoke_agentcore(question, on_chunk=on_chunk)
+                try:
+                    answer = _invoke_agentcore(question, on_chunk=on_chunk)
+                except ImportError as e:
+                    print(f"[agent_client] AgentCore SDK not installed ({e}), falling back")
+                    try:
+                        answer = _invoke_local_with_mcp(question, on_chunk=on_chunk)
+                    except (ImportError, Exception) as e2:
+                        print(f"[agent_client] MCP mode failed ({e2}), falling back to Bedrock streaming")
+                        answer = _invoke_bedrock_streaming(question, on_chunk=on_chunk)
             else:
                 try:
                     answer = _invoke_local_with_mcp(question, on_chunk=on_chunk)

@@ -50,6 +50,33 @@ aws_docs_mcp = MCPClient(
     startup_timeout=90,
 )
 
+aws_pricing_mcp = MCPClient(
+    transport_callable=lambda: stdio_client(
+        StdioServerParameters(
+            command=_UVX_PATH,
+            args=[
+                "--from",
+                "awslabs.aws-pricing-mcp-server@latest",
+                f"awslabs.aws-pricing-mcp-server{_EXE_SUFFIX}",
+            ],
+            env={
+                **os.environ,
+                "FASTMCP_LOG_LEVEL": "ERROR",
+            },
+        )
+    ),
+    tool_filters={
+        "allowed": [
+            "get_pricing",
+            "get_pricing_service_codes",
+            "get_pricing_service_attributes",
+            "get_pricing_attribute_values",
+        ]
+    },
+    prefix="pricing",
+    startup_timeout=90,
+)
+
 # aws-knowledge is an HTTP MCP server
 try:
     from mcp.client.streamable_http import streamablehttp_client
@@ -88,7 +115,10 @@ For EVERY question, follow this exact workflow:
    call read_documentation to get the full content.
 3. OPTIONALLY: Call knowledge_search_documentation for additional cross-references
    or call knowledge_get_regional_availability if the question involves region support.
-4. FINALLY: Synthesize your answer ONLY from the documentation you retrieved.
+4. OPTIONALLY: If the question involves pricing, costs, or comparisons, use the pricing
+   tools (pricing_get_pricing, pricing_get_pricing_service_codes, etc.) to get real-time
+   pricing data from the AWS Price List API.
+5. FINALLY: Synthesize your answer ONLY from the documentation you retrieved.
    Cite specific details, features, and facts from the docs.
 
 If a tool call fails or returns no results, try rephrasing your search query and search again.
@@ -108,6 +138,9 @@ Amazon Kendra, Amazon Personalize, AWS Trainium/Inferentia, Amazon Q Developer.
 - If you're not sure about something, say so rather than guessing.
 - Format in clean markdown with bullet points where helpful.
 - Focus on what's most useful for a sales/solutions architect conversation.
+- ALWAYS end your answer with a "📎 Sources" section containing markdown links to the
+  documentation pages you used. Use the exact URLs from your search/read tool results.
+  Format: `- [Page Title](https://docs.aws.amazon.com/...)`. Include at least one link.
 """
 
 app = BedrockAgentCoreApp()
@@ -125,6 +158,12 @@ def answer_question(payload, context):
         mcp_clients = []
         aws_docs_mcp.start()
         mcp_clients.append(aws_docs_mcp)
+
+        try:
+            aws_pricing_mcp.start()
+            mcp_clients.append(aws_pricing_mcp)
+        except Exception:
+            pass
 
         if aws_knowledge_mcp:
             try:

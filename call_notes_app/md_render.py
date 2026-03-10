@@ -1,14 +1,20 @@
 """Lightweight markdown-to-Tkinter renderer for the AI Answers panel.
 
 Converts streaming markdown chunks into styled Tkinter text widget inserts.
-Handles: headers, bold, bullets, code spans, and horizontal rules.
+Handles: headers, bold, bullets, code spans, links, and horizontal rules.
 """
 import re
 import tkinter as tk
+import webbrowser
 
 # Regex patterns
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _CODE_RE = re.compile(r"`([^`]+)`")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\)]+)\)")
+_BARE_URL_RE = re.compile(r"(?<!\()(https?://[^\s\)\]>,]+)")
+
+# Counter for unique link tag names
+_link_counter = 0
 
 
 def configure_tags(text_widget):
@@ -27,6 +33,13 @@ def configure_tags(text_widget):
     text_widget.tag_configure("body", foreground="#cdd6f4", font=("Segoe UI", 9))
     text_widget.tag_configure("hr", foreground="#45475a", font=("Segoe UI", 6),
                               spacing1=4, spacing3=4)
+    text_widget.tag_configure("link", foreground="#89b4fa", font=("Segoe UI", 9),
+                              underline=True)
+    # Change cursor to hand when hovering over links
+    text_widget.tag_bind("link", "<Enter>",
+                         lambda e: text_widget.config(cursor="hand2"))
+    text_widget.tag_bind("link", "<Leave>",
+                         lambda e: text_widget.config(cursor=""))
     # Keep existing tags for question/status/separator
     text_widget.tag_configure("question", foreground="#f9e2af",
                               font=("Segoe UI Semibold", 10))
@@ -115,21 +128,37 @@ class MarkdownStreamer:
 
 def _strip_md_inline(text: str) -> str:
     """Remove markdown inline formatting for plain display (headers)."""
+    text = _LINK_RE.sub(r"\1", text)
     text = _BOLD_RE.sub(r"\1", text)
     text = _CODE_RE.sub(r"\1", text)
     return text
 
 
 def _insert_inline(widget, text: str, base_tag: str):
-    """Insert text with inline bold and code formatting."""
-    # Split on bold and code patterns, inserting with appropriate tags
+    """Insert text with inline bold, code, and link formatting."""
+    global _link_counter
     pos = 0
-    # Find all bold and code spans
     spans = []
+
+    # Collect bold spans
     for m in _BOLD_RE.finditer(text):
-        spans.append((m.start(), m.end(), "bold", m.group(1)))
+        spans.append((m.start(), m.end(), "bold", m.group(1), None))
+    # Collect code spans
     for m in _CODE_RE.finditer(text):
-        spans.append((m.start(), m.end(), "code", m.group(1)))
+        spans.append((m.start(), m.end(), "code", m.group(1), None))
+    # Collect markdown links [text](url)
+    for m in _LINK_RE.finditer(text):
+        spans.append((m.start(), m.end(), "link", m.group(1), m.group(2)))
+    # Collect bare URLs (only if not already inside a markdown link)
+    for m in _BARE_URL_RE.finditer(text):
+        # Skip if this URL is part of a markdown link
+        is_inside_md_link = False
+        for s in spans:
+            if s[2] == "link" and s[0] <= m.start() < s[1]:
+                is_inside_md_link = True
+                break
+        if not is_inside_md_link:
+            spans.append((m.start(), m.end(), "link", m.group(0), m.group(0)))
 
     # Sort by position
     spans.sort(key=lambda s: s[0])
@@ -137,15 +166,30 @@ def _insert_inline(widget, text: str, base_tag: str):
     # Remove overlapping spans (keep first)
     filtered = []
     last_end = 0
-    for start, end, tag, content in spans:
+    for start, end, tag, content, url in spans:
         if start >= last_end:
-            filtered.append((start, end, tag, content))
+            filtered.append((start, end, tag, content, url))
             last_end = end
 
-    for start, end, tag, content in filtered:
+    for start, end, tag, content, url in filtered:
         if pos < start:
             widget.insert(tk.END, text[pos:start], base_tag)
-        widget.insert(tk.END, content, tag)
+        if tag == "link" and url:
+            # Create a unique tag for this link so each has its own click handler
+            _link_counter += 1
+            link_tag = f"link_{_link_counter}"
+            widget.tag_configure(link_tag, foreground="#89b4fa", font=("Segoe UI", 9),
+                                 underline=True)
+            link_url = url  # capture for closure
+            widget.tag_bind(link_tag, "<Button-1>",
+                            lambda e, u=link_url: webbrowser.open(u))
+            widget.tag_bind(link_tag, "<Enter>",
+                            lambda e: widget.config(cursor="hand2"))
+            widget.tag_bind(link_tag, "<Leave>",
+                            lambda e: widget.config(cursor=""))
+            widget.insert(tk.END, content, ("link", link_tag))
+        else:
+            widget.insert(tk.END, content, tag)
         pos = end
 
     if pos < len(text):
