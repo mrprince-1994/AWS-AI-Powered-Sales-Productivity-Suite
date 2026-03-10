@@ -268,41 +268,61 @@ def _invoke_agentcore(question: str, on_chunk=None) -> str:
     import websocket as ws_lib
     from bedrock_agentcore.runtime import AgentCoreRuntimeClient
 
+    print(f"[agent_client] Invoking AgentCore agent: {AGENTCORE_RUNTIME_ARN}")
     client = AgentCoreRuntimeClient(region=AWS_REGION)
     ws_url, headers = client.generate_ws_connection(
         runtime_arn=AGENTCORE_RUNTIME_ARN,
         endpoint_name="DEFAULT",
     )
 
+    # websocket-client expects headers as a list of "Key: Value" strings
+    header_list = [f"{k}: {v}" for k, v in headers.items()]
+
     payload = json.dumps({"prompt": question})
     full_response = []
 
-    ws = ws_lib.create_connection(ws_url, header=headers, timeout=120)
+    print(f"[agent_client] Connecting to WebSocket...")
+    ws = ws_lib.create_connection(ws_url, header=header_list, timeout=180)
     try:
         ws.send(payload)
+        print(f"[agent_client] Payload sent, waiting for response...")
         while True:
-            result = ws.recv()
+            try:
+                result = ws.recv()
+            except ws_lib.WebSocketConnectionClosedException:
+                print("[agent_client] WebSocket closed by server")
+                break
+
             if not result:
                 break
+
+            print(f"[agent_client] Received {len(result)} bytes")
             try:
                 data = json.loads(result)
-                # Handle different response shapes
-                text = data.get("answer", data.get("result", ""))
+                # Handle different response shapes from AgentCore
+                text = data.get("answer", data.get("result", data.get("text", "")))
                 if text:
                     full_response.append(text)
                     if on_chunk:
                         on_chunk(text)
+                elif isinstance(data, str):
+                    full_response.append(data)
+                    if on_chunk:
+                        on_chunk(data)
             except json.JSONDecodeError:
                 # Plain text response
                 full_response.append(result)
                 if on_chunk:
                     on_chunk(result)
-    except ws_lib.WebSocketConnectionClosedException:
-        pass
+    except Exception as e:
+        print(f"[agent_client] WebSocket error: {e}")
+        raise
     finally:
         ws.close()
 
-    return "".join(full_response)
+    answer = "".join(full_response)
+    print(f"[agent_client] Got response: {len(answer)} chars")
+    return answer
 
 
 def _invoke_local_with_mcp(question: str, on_chunk=None) -> str:
@@ -379,6 +399,13 @@ def ask_agent(question: str, callback=None, on_chunk=None):
                     except (ImportError, Exception) as e2:
                         print(f"[agent_client] MCP mode failed ({e2}), falling back to Bedrock streaming")
                         answer = _invoke_bedrock_streaming(question, on_chunk=on_chunk)
+                except Exception as e:
+                    print(f"[agent_client] AgentCore invoke failed ({e}), falling back")
+                    try:
+                        answer = _invoke_local_with_mcp(question, on_chunk=on_chunk)
+                    except (ImportError, Exception) as e2:
+                        print(f"[agent_client] MCP mode failed ({e2}), falling back to Bedrock streaming")
+                        answer = _invoke_bedrock_streaming(question, on_chunk=on_chunk)
             else:
                 try:
                     answer = _invoke_local_with_mcp(question, on_chunk=on_chunk)
@@ -388,6 +415,7 @@ def ask_agent(question: str, callback=None, on_chunk=None):
             if callback:
                 callback(answer, None)
         except Exception as e:
+            print(f"[agent_client] All modes failed: {e}")
             if callback:
                 callback(None, f"Error: {e}")
 
