@@ -9,8 +9,7 @@ from history import save_session, list_sessions, get_all_customers
 from question_detector import is_aws_aiml_question, extract_question
 from agent_client import ask_agent, warmup as warmup_agent, shutdown as shutdown_agent
 from md_render import configure_tags, MarkdownStreamer
-from notes_retriever import scan_notes, ask_notes_agent
-from config import NOTES_BASE_DIR
+from notes_retriever import scan_notes, ask_notes_agent, NOTE_SOURCES
 
 # --- Color Palette ---
 BG_DARK = "#0f0f1a"
@@ -666,17 +665,34 @@ class NotesRetrieverTab:
             font=ctk.CTkFont("Segoe UI", 11))
         self.index_label.pack(side=tk.RIGHT, padx=(0, 12))
 
-        # Directory info bar
+        # Directory info bar — show all configured sources
         dir_bar = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=6)
         dir_bar.pack(fill=tk.X, padx=16, pady=(0, 8))
-        ctk.CTkLabel(dir_bar, text=f"📁  {NOTES_BASE_DIR}",
-                     text_color=FG_DIM, font=ctk.CTkFont("Consolas", 10),
-                     anchor="w").pack(fill=tk.X, padx=10, pady=5)
+        for _, label in NOTE_SOURCES:
+            ctk.CTkLabel(dir_bar, text=f"📁  {label}",
+                         text_color=FG_DIM, font=ctk.CTkFont("Consolas", 10),
+                         anchor="w").pack(fill=tk.X, padx=10, pady=(4, 0))
+        ctk.CTkFrame(dir_bar, fg_color="transparent", height=4).pack()  # bottom padding
 
-        # Customer filter row
+        # Source + customer filter row
         filter_row = ctk.CTkFrame(parent, fg_color="transparent")
         filter_row.pack(fill=tk.X, padx=16, pady=(0, 6))
-        ctk.CTkLabel(filter_row, text="Scope to customer:",
+
+        ctk.CTkLabel(filter_row, text="Source:",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
+        self.source_filter_var = tk.StringVar(value="All Sources")
+        source_options = ["All Sources"] + [label for _, label in NOTE_SOURCES]
+        self.source_combo = ctk.CTkComboBox(
+            filter_row, variable=self.source_filter_var, width=140,
+            fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
+            button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
+            dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
+            values=source_options,
+            command=lambda _: self._new_chat())
+        self.source_combo.pack(side=tk.LEFT, padx=(8, 16))
+
+        ctk.CTkLabel(filter_row, text="Customer:",
                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
         self.customer_filter_var = tk.StringVar(value="(All)")
         self.customer_combo = ctk.CTkComboBox(
@@ -686,10 +702,10 @@ class NotesRetrieverTab:
             dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
             font=ctk.CTkFont("Segoe UI", 11), state="readonly",
             values=["(All)"],
-            command=lambda _: self._new_chat())   # changing scope resets chat
+            command=lambda _: self._new_chat())
         self.customer_combo.pack(side=tk.LEFT, padx=(8, 0))
         ctk.CTkLabel(filter_row,
-                     text="  (changing scope starts a new chat)",
+                     text="  (changing filters starts a new chat)",
                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
 
         # Suggested prompts
@@ -815,12 +831,7 @@ class NotesRetrieverTab:
 
     def _refresh_index(self):
         all_notes = scan_notes()
-        selected = self.customer_filter_var.get()
-        if selected and selected != "(All)":
-            self._notes_meta = [n for n in all_notes if n["customer"] == selected]
-        else:
-            self._notes_meta = all_notes
-
+        self._all_notes_cache = all_notes
         customers = ["(All)"] + sorted({n["customer"] for n in all_notes})
         self.customer_combo.after(0, lambda: self._update_index_ui(all_notes, customers))
 
@@ -831,15 +842,19 @@ class NotesRetrieverTab:
             text=f"{count} note{'s' if count != 1 else ''} indexed")
         self.notes_list.delete(0, tk.END)
         for note in all_notes:
-            label = f"{note['customer']}  ·  {note['date'] or note['filename']}"
+            source_tag = f"[{note.get('source', '?')}]"
+            label = f"{source_tag}  {note['customer']}  ·  {note['date'] or note['filename']}"
             self.notes_list.insert(tk.END, label)
 
     def _get_active_notes(self) -> list[dict]:
-        """Return notes filtered by the current customer selection."""
-        selected = self.customer_filter_var.get()
-        all_notes = self._notes_meta if self._notes_meta else scan_notes()
-        if selected and selected != "(All)":
-            return [n for n in all_notes if n["customer"] == selected]
+        """Return notes filtered by the current source and customer selections."""
+        all_notes = getattr(self, "_all_notes_cache", None) or scan_notes()
+        source = self.source_filter_var.get()
+        if source and source != "All Sources":
+            all_notes = [n for n in all_notes if n.get("source") == source]
+        customer = self.customer_filter_var.get()
+        if customer and customer != "(All)":
+            all_notes = [n for n in all_notes if n["customer"] == customer]
         return all_notes
 
     def _send(self):
