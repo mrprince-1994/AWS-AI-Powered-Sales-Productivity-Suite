@@ -11,8 +11,8 @@ from botocore.config import Config
 from docx import Document
 from config import AWS_REGION, NOTES_BASE_DIR
 
-# Claude Opus 4.5 for deep retrieval reasoning
-OPUS_MODEL_ID = "us.anthropic.claude-opus-4-5-20251101-v1:0"
+# Claude Opus 4.6 for deep retrieval reasoning
+OPUS_MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
 
 RETRIEVAL_SYSTEM_PROMPT = """You are an expert assistant that helps retrieve and synthesize \
 information from historical customer call notes.
