@@ -158,14 +158,23 @@ def scan_notes(sources: list[tuple[str, str]] | None = None) -> list[dict]:
     return notes
 
 
-def _build_index_text(notes_meta: list[dict]) -> str:
-    """Build a compact index string listing all available files."""
-    lines = ["Available note files (use file_id with read_note_file tool):\n"]
-    for i, note in enumerate(notes_meta):
+def _build_index_text(notes_meta: list[dict], max_entries: int = 200) -> str:
+    """Build a compact index string listing available files.
+
+    Caps at max_entries to keep the index prompt manageable.
+    Files are assumed to be pre-sorted by relevance by the caller.
+    """
+    total = len(notes_meta)
+    shown = notes_meta[:max_entries]
+    lines = [f"Available note files ({total} total, showing {len(shown)}):\n"]
+    for i, note in enumerate(shown):
         lines.append(
             f"  file_{i}: [{note.get('source','?')}] customer={note['customer']} "
             f"date={note['date'] or 'unknown'} filename={note['filename']}"
         )
+    if total > max_entries:
+        lines.append(f"\n  ... and {total - max_entries} more files not shown. "
+                     f"Use the Customer filter in the UI to narrow results.")
     return "\n".join(lines)
 
 
@@ -202,11 +211,25 @@ def ask_notes_agent(
                 return
 
             # Build file_id → metadata map
-            file_map = {f"file_{i}": note for i, note in enumerate(notes_meta)}
+            # Sort by relevance to the question so matching files get low IDs
+            # and are within the index cap
+            q_lower = question.lower()
+            q_words = set(q_lower.split())
+
+            def _relevance(n):
+                cust = n["customer"].lower()
+                if cust in q_lower:
+                    return 0  # exact customer name in question
+                if any(w in cust for w in q_words if len(w) > 3):
+                    return 1  # partial word match
+                return 2
+
+            sorted_notes = sorted(notes_meta, key=_relevance)
+            file_map = {f"file_{i}": note for i, note in enumerate(sorted_notes)}
 
             # First turn: inject the index
             if not conversation_history:
-                index_text = _build_index_text(notes_meta)
+                index_text = _build_index_text(sorted_notes)
                 user_content = f"{index_text}\n\n---\n\n{question}"
             else:
                 user_content = question
@@ -226,7 +249,6 @@ def ask_notes_agent(
             for _round in range(MAX_TOOL_ROUNDS):
                 payload = {
                     "anthropic_version": "bedrock-2023-05-31",
-                    "anthropic_beta": [CONTEXT_1M_BETA],
                     "max_tokens": 8192,
                     "system": RETRIEVAL_SYSTEM_PROMPT,
                     "messages": conversation_history,
@@ -277,9 +299,8 @@ def ask_notes_agent(
                                 current_block["text"] = "".join(
                                     current_block["_text_parts"])
                             elif current_block.get("type") == "tool_use":
-                                current_block["input"] = json.loads(
-                                    "".join(current_block["_input_parts"]) or "{}")
-                            # Clean up temp keys
+                                raw_input = "".join(current_block["_input_parts"])
+                                current_block["input"] = json.loads(raw_input) if raw_input.strip() else {}
                             current_block.pop("_text_parts", None)
                             current_block.pop("_input_parts", None)
                             content_blocks.append(current_block)
@@ -287,6 +308,10 @@ def ask_notes_agent(
 
                     elif etype == "message_delta":
                         stop_reason = chunk.get("delta", {}).get("stop_reason")
+
+                    elif etype == "error":
+                        # Surface API-level errors (e.g. unsupported beta flag)
+                        raise RuntimeError(f"API error: {chunk}")
 
                 # Append assistant turn to history
                 conversation_history.append({
@@ -298,6 +323,16 @@ def ask_notes_agent(
                 tool_use_blocks = [b for b in content_blocks if b.get("type") == "tool_use"]
                 if not tool_use_blocks:
                     break
+
+                # Notify user which files are being read
+                file_names = []
+                for tb in tool_use_blocks:
+                    fid = tb.get("input", {}).get("file_id", "")
+                    note = file_map.get(fid)
+                    if note:
+                        file_names.append(note["filename"])
+                if file_names and on_chunk:
+                    on_chunk(f"📂 Reading: {', '.join(file_names)}\n\n")
 
                 # Execute tool calls and build tool_result turn
                 tool_results = []
@@ -326,16 +361,21 @@ def ask_notes_agent(
                 })
 
             answer = "".join(final_answer_parts)
+            if not answer.strip():
+                answer = "⚠️ No response generated. The model may have only used tools without producing a final answer. Try rephrasing your question."
+                if on_chunk:
+                    on_chunk(answer)
             if callback:
                 callback(answer, None)
 
         except Exception as e:
             if conversation_history and conversation_history[-1]["role"] == "user":
                 conversation_history.pop()
-            err = f"Error querying notes: {e}"
+            import traceback
+            err = f"Error querying notes: {e}\n\n```\n{traceback.format_exc()}\n```"
             if on_chunk:
                 on_chunk(err)
             if callback:
-                callback(None, err)
+                callback(None, str(e))
 
     threading.Thread(target=_run, daemon=True).start()
