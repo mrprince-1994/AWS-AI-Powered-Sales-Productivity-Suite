@@ -832,7 +832,13 @@ class NotesRetrieverTab:
     def _refresh_index(self):
         all_notes = scan_notes()
         self._all_notes_cache = all_notes
-        customers = ["(All)"] + sorted({n["customer"] for n in all_notes})
+        # De-dupe customers case-insensitively, preserving original casing
+        seen = {}
+        for n in all_notes:
+            key = n["customer"].lower()
+            if key not in seen:
+                seen[key] = n["customer"]
+        customers = ["(All)"] + sorted(seen.values(), key=str.lower)
         self.customer_combo.after(0, lambda: self._update_index_ui(all_notes, customers))
 
     def _update_index_ui(self, all_notes, customers):
@@ -847,14 +853,23 @@ class NotesRetrieverTab:
             self.notes_list.insert(tk.END, label)
 
     def _get_active_notes(self) -> list[dict]:
-        """Return notes filtered by the current source and customer selections."""
+        """Return notes filtered by source and customer (case-insensitive, cross-source)."""
         all_notes = getattr(self, "_all_notes_cache", None) or scan_notes()
+
         source = self.source_filter_var.get()
         if source and source != "All Sources":
             all_notes = [n for n in all_notes if n.get("source") == source]
+
         customer = self.customer_filter_var.get()
         if customer and customer != "(All)":
-            all_notes = [n for n in all_notes if n["customer"] == customer]
+            # Case-insensitive match so "RapidAI" finds notes in both sources
+            # regardless of how the subfolder is named
+            customer_lower = customer.lower()
+            all_notes = [
+                n for n in all_notes
+                if n["customer"].lower() == customer_lower
+                or customer_lower in n["customer"].lower()
+            ]
         return all_notes
 
     def _send(self):
