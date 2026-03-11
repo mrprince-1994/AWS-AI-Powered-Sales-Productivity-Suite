@@ -9,6 +9,8 @@ from history import save_session, list_sessions, get_all_customers
 from question_detector import is_aws_aiml_question, extract_question
 from agent_client import ask_agent, warmup as warmup_agent, shutdown as shutdown_agent
 from md_render import configure_tags, MarkdownStreamer
+from notes_retriever import scan_notes, ask_notes_agent
+from config import NOTES_BASE_DIR
 
 # --- Color Palette ---
 BG_DARK = "#0f0f1a"
@@ -59,10 +61,13 @@ class StyledText(tk.Text):
 class CallNotesApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Call Notes — Live Transcriber")
-        self.root.geometry("1440x860")
-        self.root.minsize(1100, 700)
-        self.root.configure(fg_color=BG_DARK)
+        # Support both CTk root window and CTkFrame (tab)
+        self._is_root = isinstance(root, ctk.CTk)
+        if self._is_root:
+            self.root.title("Call Notes — Live Transcriber")
+            self.root.geometry("1440x860")
+            self.root.minsize(1100, 700)
+            self.root.configure(fg_color=BG_DARK)
 
         self.transcriber = None
         self._current_transcript = ""
@@ -73,21 +78,25 @@ class CallNotesApp:
         self._load_devices()
 
         warmup_agent()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self._is_root:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ─────────────────────────── UI BUILD ───────────────────────────
 
     def _build_ui(self):
-        # Title bar
-        title_bar = ctk.CTkFrame(self.root, fg_color="transparent")
-        title_bar.pack(fill=tk.X, padx=20, pady=(16, 0))
-        ctk.CTkLabel(title_bar, text="🎙  Call Notes",
-                     font=ctk.CTkFont("Segoe UI", 20, "bold"),
-                     text_color=FG_BRIGHT).pack(side=tk.LEFT)
-        self.status_var = tk.StringVar(value="Ready")
-        ctk.CTkLabel(title_bar, textvariable=self.status_var,
-                     font=ctk.CTkFont("Segoe UI", 12), text_color=ORANGE
-                     ).pack(side=tk.RIGHT)
+        # Title bar — only shown when running standalone (not in tab)
+        if self._is_root:
+            title_bar = ctk.CTkFrame(self.root, fg_color="transparent")
+            title_bar.pack(fill=tk.X, padx=20, pady=(16, 0))
+            ctk.CTkLabel(title_bar, text="🎙  Call Notes",
+                         font=ctk.CTkFont("Segoe UI", 20, "bold"),
+                         text_color=FG_BRIGHT).pack(side=tk.LEFT)
+            self.status_var = tk.StringVar(value="Ready")
+            ctk.CTkLabel(title_bar, textvariable=self.status_var,
+                         font=ctk.CTkFont("Segoe UI", 12), text_color=ORANGE
+                         ).pack(side=tk.RIGHT)
+        else:
+            self.status_var = tk.StringVar(value="Ready")
 
         # 3-column layout
         cols = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -100,8 +109,15 @@ class CallNotesApp:
         self._build_center_panel(cols)
         self._build_ai_panel(cols)
 
-        self.root.after(500, self._refresh_history)
+        # Status bar at bottom (only in tab/embedded mode — standalone uses title bar)
+        if not self._is_root:
+            status_bar = ctk.CTkFrame(self.root, fg_color=BG_CARD, corner_radius=0, height=28)
+            status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+            ctk.CTkLabel(status_bar, textvariable=self.status_var,
+                         text_color=ORANGE, font=ctk.CTkFont("Segoe UI", 11),
+                         anchor="w").pack(side=tk.LEFT, padx=12, pady=4)
 
+        self.root.after(500, self._refresh_history)
     # ── Left: History ──
     def _build_history_panel(self, parent):
         card = ctk.CTkFrame(parent, fg_color=BG_PANEL, corner_radius=12,
@@ -280,7 +296,8 @@ class CallNotesApp:
             shutdown_agent()
         except Exception:
             pass
-        self.root.destroy()
+        if self._is_root:
+            self.root.destroy()
 
     def _toggle_ai(self):
         self._ai_enabled = self.ai_toggle_var.get()
@@ -607,9 +624,275 @@ class CallNotesApp:
         self.notes_text.see(tk.END)
 
 
+class NotesRetrieverTab:
+    """Tab 2 — query historical call notes via Claude Opus 4."""
+
+    def __init__(self, parent):
+        self._notes_meta = []
+        self._streaming_started = False
+        self._md_streamer = None
+        self._build_ui(parent)
+        # Load notes index in background on startup
+        threading.Thread(target=self._refresh_index, daemon=True).start()
+
+    def _build_ui(self, parent):
+        # Top bar: index info + refresh
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.pack(fill=tk.X, padx=16, pady=(14, 6))
+
+        ctk.CTkLabel(top, text="📂  Historical Notes Retrieval",
+                     font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                     text_color=FG_BRIGHT).pack(side=tk.LEFT)
+
+        self.refresh_btn = ctk.CTkButton(
+            top, text="⟳ Refresh Index", width=130, height=30,
+            fg_color=BG_INPUT, hover_color=BG_CARD, text_color=ACCENT,
+            border_width=1, border_color=BORDER, corner_radius=6,
+            font=ctk.CTkFont("Segoe UI", 11),
+            command=lambda: threading.Thread(target=self._refresh_index, daemon=True).start())
+        self.refresh_btn.pack(side=tk.RIGHT)
+
+        self.index_label = ctk.CTkLabel(
+            top, text="Scanning...", text_color=FG_DIM,
+            font=ctk.CTkFont("Segoe UI", 11))
+        self.index_label.pack(side=tk.RIGHT, padx=(0, 12))
+
+        # Directory info
+        dir_bar = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=6)
+        dir_bar.pack(fill=tk.X, padx=16, pady=(0, 10))
+        ctk.CTkLabel(dir_bar, text=f"📁  {NOTES_BASE_DIR}",
+                     text_color=FG_DIM, font=ctk.CTkFont("Consolas", 10),
+                     anchor="w").pack(fill=tk.X, padx=10, pady=6)
+
+        # Customer filter + question row
+        ask_row = ctk.CTkFrame(parent, fg_color="transparent")
+        ask_row.pack(fill=tk.X, padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(ask_row, text="Customer:", text_color=FG_DIM,
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(side=tk.LEFT)
+        self.customer_filter_var = tk.StringVar(value="(All)")
+        self.customer_combo = ctk.CTkComboBox(
+            ask_row, variable=self.customer_filter_var, width=180,
+            fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
+            button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
+            dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
+            values=["(All)"])
+        self.customer_combo.pack(side=tk.LEFT, padx=(8, 16))
+
+        self.question_var = tk.StringVar()
+        q_entry = ctk.CTkEntry(
+            ask_row, textvariable=self.question_var,
+            fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 12), corner_radius=6,
+            placeholder_text="Ask anything about your past calls...")
+        q_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        q_entry.bind("<Return>", lambda e: self._ask())
+
+        self.ask_btn = ctk.CTkButton(
+            ask_row, text="Ask", width=80, height=36,
+            fg_color=YELLOW, hover_color=YELLOW_HOVER, text_color=BG_DARK,
+            font=ctk.CTkFont("Segoe UI", 13, "bold"), corner_radius=6,
+            command=self._ask)
+        self.ask_btn.pack(side=tk.RIGHT)
+
+        # Suggested prompts
+        prompts_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        prompts_frame.pack(fill=tk.X, padx=16, pady=(0, 8))
+        ctk.CTkLabel(prompts_frame, text="Suggestions:",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
+        for prompt in [
+            "What action items are outstanding?",
+            "Summarize all calls with this customer",
+            "What pricing was discussed?",
+            "What follow-ups were promised?",
+        ]:
+            ctk.CTkButton(
+                prompts_frame, text=prompt, height=24,
+                fg_color=BG_CARD, hover_color=BG_INPUT, text_color=FG_DIM,
+                border_width=1, border_color=BORDER, corner_radius=12,
+                font=ctk.CTkFont("Segoe UI", 10),
+                command=lambda p=prompt: self._use_suggestion(p)
+            ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Two-column layout: notes list + answer
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=3)
+        body.rowconfigure(0, weight=1)
+
+        # Left: notes index list
+        left = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=10,
+                             border_width=1, border_color=BORDER)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(left, text="Indexed Notes",
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color=ACCENT).pack(anchor=tk.W, padx=12, pady=(10, 6))
+
+        list_frame = ctk.CTkFrame(left, fg_color=BG_INPUT, corner_radius=6,
+                                   border_width=1, border_color=BORDER)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.notes_list = tk.Listbox(
+            list_frame, bg=BG_INPUT, fg=FG_TEXT,
+            selectbackground=ACCENT, selectforeground=BG_DARK,
+            font=("Segoe UI", 9), borderwidth=0, highlightthickness=0,
+            activestyle="none")
+        sb = tk.Scrollbar(list_frame, command=self.notes_list.yview,
+                          bg=BG_INPUT, troughcolor=BG_INPUT, bd=0)
+        self.notes_list.configure(yscrollcommand=sb.set)
+        self.notes_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Right: answer display
+        right = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=10,
+                              border_width=1, border_color=BORDER)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        ans_header = ctk.CTkFrame(right, fg_color="transparent")
+        ans_header.pack(fill=tk.X, padx=12, pady=(10, 6))
+        ctk.CTkLabel(ans_header, text="Answer",
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color=YELLOW).pack(side=tk.LEFT)
+        ctk.CTkLabel(ans_header, text="Claude Opus 4  ·  Bedrock",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.RIGHT)
+        ctk.CTkButton(ans_header, text="Clear", width=55, height=26,
+                      fg_color=BG_INPUT, hover_color=BG_CARD, text_color=ACCENT,
+                      corner_radius=6, font=ctk.CTkFont("Segoe UI", 10),
+                      command=self._clear_answer).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.answer_text = StyledText(right, font=("Segoe UI", 10))
+        self.answer_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        configure_tags(self.answer_text)
+
+    # ── Actions ──
+
+    def _use_suggestion(self, prompt):
+        self.question_var.set(prompt)
+        self._ask()
+
+    def _clear_answer(self):
+        self.answer_text.config(state=tk.NORMAL)
+        self.answer_text.delete("1.0", tk.END)
+        self.answer_text.config(state=tk.DISABLED)
+
+    def _refresh_index(self):
+        all_notes = scan_notes()
+        # Filter by selected customer
+        selected = self.customer_filter_var.get()
+        if selected and selected != "(All)":
+            self._notes_meta = [n for n in all_notes if n["customer"] == selected]
+        else:
+            self._notes_meta = all_notes
+
+        customers = ["(All)"] + sorted({n["customer"] for n in all_notes})
+        # Update UI on main thread
+        self.customer_combo.after(0, lambda: self._update_index_ui(all_notes, customers))
+
+    def _update_index_ui(self, all_notes, customers):
+        self.customer_combo.configure(values=customers)
+        count = len(all_notes)
+        self.index_label.configure(
+            text=f"{count} note{'s' if count != 1 else ''} indexed")
+
+        self.notes_list.delete(0, tk.END)
+        for note in all_notes:
+            label = f"{note['customer']}  ·  {note['date'] or note['filename']}"
+            self.notes_list.insert(tk.END, label)
+
+    def _ask(self):
+        question = self.question_var.get().strip()
+        if not question:
+            return
+
+        # Re-filter notes by customer selection before asking
+        selected = self.customer_filter_var.get()
+        all_notes = self._notes_meta if self._notes_meta else scan_notes()
+        if selected and selected != "(All)":
+            notes_to_query = [n for n in all_notes if n["customer"] == selected]
+        else:
+            notes_to_query = all_notes
+
+        self.question_var.set("")
+        self.ask_btn.configure(state=tk.DISABLED, text="...")
+
+        self.answer_text.config(state=tk.NORMAL)
+        if self.answer_text.get("1.0", "end-1c").strip():
+            self.answer_text.insert(tk.END, "\n" + "─" * 50 + "\n", "separator")
+        self.answer_text.insert(tk.END, f"❓ {question}\n", "question")
+        self.answer_text.insert(tk.END, "⏳ Reading notes and thinking...\n", "status")
+        self.answer_text.see(tk.END)
+        self.answer_text.config(state=tk.DISABLED)
+
+        self._streaming_started = False
+        self._md_streamer = MarkdownStreamer(self.answer_text)
+
+        def on_chunk(text):
+            self.answer_text.after(0, self._append_chunk, text)
+
+        def on_done(answer, error):
+            self.answer_text.after(0, self._finish, error)
+
+        ask_notes_agent(question, notes_to_query, on_chunk=on_chunk, callback=on_done)
+
+    def _append_chunk(self, text):
+        self.answer_text.config(state=tk.NORMAL)
+        if not self._streaming_started:
+            self._streaming_started = True
+            pos = self.answer_text.search("⏳ Reading notes and thinking...", "1.0", tk.END)
+            if pos:
+                self.answer_text.delete(pos, f"{pos} lineend+1c")
+        self._md_streamer.feed(text)
+        self.answer_text.see(tk.END)
+        self.answer_text.config(state=tk.DISABLED)
+
+    def _finish(self, error):
+        self.answer_text.config(state=tk.NORMAL)
+        if error:
+            pos = self.answer_text.search("⏳ Reading notes and thinking...", "1.0", tk.END)
+            if pos:
+                self.answer_text.delete(pos, f"{pos} lineend+1c")
+            self.answer_text.insert(tk.END, f"⚠️ {error}\n", "status")
+        else:
+            if self._md_streamer:
+                self._md_streamer.flush()
+            if self.answer_text.get("end-2c", "end-1c") != "\n":
+                self.answer_text.insert(tk.END, "\n")
+        self.answer_text.see(tk.END)
+        self.answer_text.config(state=tk.DISABLED)
+        self.ask_btn.configure(state=tk.NORMAL, text="Ask")
+
+
 def main():
     root = ctk.CTk()
-    CallNotesApp(root)
+    root.title("Call Notes — Live Transcriber")
+    root.geometry("1440x860")
+    root.minsize(1100, 700)
+    root.configure(fg_color=BG_DARK)
+
+    # Tab container
+    tabview = ctk.CTkTabview(root, fg_color=BG_PANEL, segmented_button_fg_color=BG_CARD,
+                              segmented_button_selected_color=ACCENT,
+                              segmented_button_selected_hover_color=ACCENT_HOVER,
+                              segmented_button_unselected_color=BG_CARD,
+                              segmented_button_unselected_hover_color=BG_INPUT,
+                              text_color=FG_BRIGHT, text_color_disabled=FG_DIM,
+                              border_width=1, border_color=BORDER,
+                              corner_radius=12)
+    tabview.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+    tabview.add("🎙  Live Transcription")
+    tabview.add("🔍  Notes Retrieval")
+
+    # Tab 1 — existing app (pass the tab frame as root)
+    tab1_frame = tabview.tab("🎙  Live Transcription")
+    app = CallNotesApp(tab1_frame)
+
+    # Tab 2 — retrieval agent
+    tab2_frame = tabview.tab("🔍  Notes Retrieval")
+    NotesRetrieverTab(tab2_frame)
+
+    root.protocol("WM_DELETE_WINDOW", lambda: (shutdown_agent(), root.destroy()))
     root.mainloop()
 
 
