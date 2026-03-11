@@ -28,17 +28,22 @@ NOTE_SOURCES = [
 RETRIEVAL_SYSTEM_PROMPT = """You are an expert assistant that helps retrieve and synthesize \
 information from historical customer call notes.
 
-At the start of each conversation you are given a collection of call notes from past customer \
-meetings, each labeled with the customer name, filename, date, and source (who wrote the notes). \
-Use these notes as your primary source of truth throughout the conversation.
+At the start of each conversation you are given:
+1. An explicit index listing every note file you have received (customer, source, filename, date)
+2. The full text content of each of those files
+
+CRITICAL RULES:
+- You MUST search the full content of every file listed in the index before saying a customer is not found
+- If a customer appears in the index, their notes ARE in the context — search carefully
+- Customer names may appear in filenames like "[03_03] BQE - Discovery.docx" — the customer is "BQE"
+- Never say you cannot find a customer if they appear in the index you were given
+- If you genuinely cannot find relevant content after searching, quote the exact filename(s) you checked
 
 Guidelines:
-- Always cite which customer, which note file, and which source (My Notes / SA Team) your answer comes from
+- Always cite which customer, which note file, and which source (My Notes / Sanghwa / Ayman) your answer comes from
 - If multiple notes are relevant, synthesize across them
-- If you cannot find relevant information in the provided notes, say so clearly
 - Be specific: include names, dates, numbers, and commitments mentioned in the notes
 - Format your response in clean markdown with clear sections
-- If asked about a specific customer, focus on their notes
 - Highlight action items, decisions, and follow-ups when relevant
 - Remember context from earlier in the conversation — the user may ask follow-up questions \
   that refer back to previous answers"""
@@ -135,12 +140,23 @@ def scan_notes(sources: list[tuple[str, str]] | None = None) -> list[dict]:
     return notes
 
 
-def build_context(notes_meta: list[dict], max_chars: int = 180_000) -> str:
-    """Read note files and build a context string for the first LLM turn."""
+def build_context(notes_meta: list[dict], max_chars: int = 380_000,
+                  max_chars_per_note: int = 12_000) -> str:
+    """Read note files and build a context string for the first LLM turn.
+
+    Notes are included in the order provided (caller should sort by relevance).
+    Each note is capped at max_chars_per_note so no single file crowds out others.
+    Total context is capped at max_chars (Claude Opus 4.6 supports ~200k tokens ≈ 800k chars,
+    but we stay conservative to leave room for the conversation).
+    """
     parts = []
     total = 0
+    skipped = 0
     for note in notes_meta:
         text = _read_docx_text(note["filepath"])
+        # Cap individual note size so one large file doesn't crowd out others
+        if len(text) > max_chars_per_note:
+            text = text[:max_chars_per_note] + "\n[...note truncated for length...]"
         header = (
             f"=== CUSTOMER: {note['customer']} | "
             f"SOURCE: {note.get('source', 'unknown')} | "
@@ -149,13 +165,13 @@ def build_context(notes_meta: list[dict], max_chars: int = 180_000) -> str:
         )
         entry = header + text + "\n\n"
         if total + len(entry) > max_chars:
-            remaining = max_chars - total - len(header) - 100
-            if remaining > 200:
-                entry = header + text[:remaining] + "\n[...truncated...]\n\n"
-            else:
-                break
+            skipped += 1
+            continue  # skip rather than hard-stop so earlier notes aren't lost
         parts.append(entry)
         total += len(entry)
+
+    if skipped:
+        parts.append(f"\n[Note: {skipped} additional file(s) were omitted due to context size limits.]\n")
 
     return "".join(parts)
 
@@ -197,9 +213,27 @@ def ask_notes_agent(
 
             # First turn: prepend the notes context to the user message
             if not conversation_history:
-                context = build_context(notes_meta)
+                # Sort: put notes whose customer name appears in the question first
+                q_lower = question.lower()
+                def relevance_key(n):
+                    cust = n["customer"].lower()
+                    # Exact or partial match in question → highest priority
+                    if cust in q_lower or any(word in cust for word in q_lower.split()):
+                        return 0
+                    return 1
+
+                sorted_notes = sorted(notes_meta, key=relevance_key)
+                context = build_context(sorted_notes)
+
+                # Build an index summary so the LLM knows exactly what files it received
+                index_lines = "\n".join(
+                    f"  - [{n.get('source','?')}] {n['customer']} | {n['filename']} | {n['date'] or 'no date'}"
+                    for n in sorted_notes
+                )
                 user_content = (
-                    f"Here are the historical call notes for this conversation:\n\n"
+                    f"You have been provided with {len(sorted_notes)} call note file(s) "
+                    f"from the following sources:\n{index_lines}\n\n"
+                    f"Here are the full contents of those notes:\n\n"
                     f"{context}\n\n---\n\n{question}"
                 )
             else:
