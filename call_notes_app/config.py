@@ -8,7 +8,7 @@ SAMPLE_RATE = 16000  # Amazon Transcribe expects 16kHz for best results
 CHANNELS = 1
 
 # Notes output directory
-NOTES_BASE_DIR = r"C:\Users\mrprince\Desktop\AWS\Generative AI\SMB West\Call Notes"
+NOTES_BASE_DIR = r"C:\Users\mrprince\OneDrive - amazon.com\mrprince SMB WE - Documents\Call Notes"
 
 # Claude model ID on Bedrock
 CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-6"

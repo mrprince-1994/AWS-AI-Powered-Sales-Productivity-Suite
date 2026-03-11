@@ -35,7 +35,7 @@ Anything that was raised but not resolved, or that needs further investigation.
 Planned follow-ups, next meetings, or milestones discussed.
 
 ## Key Quotes & Verbatim Notes
-Any particularly important statements, commitments, or notable quotes worth preserving exactly.
+Any particularly important statements, commitments, or notable quotes worth preserving.
 
 ## Additional Context
 Background information, references to documents/tools/systems, or anything else
@@ -46,42 +46,29 @@ names, numbers, and technical details exactly as stated."""
 
 
 def generate_notes(transcript: str, customer_name: str, on_chunk=None) -> str:
-    """Send transcript to Claude on Bedrock and stream back comprehensive notes.
-
-    Args:
-        transcript: The raw call transcript.
-        customer_name: Name of the customer/meeting.
-        on_chunk: Optional callback(str) called with each text chunk as it arrives.
-
-    Returns:
-        The full generated notes text.
-    """
+    """Send transcript to Claude on Bedrock and stream back comprehensive notes."""
     client = boto3.client(
         "bedrock-runtime",
         region_name=AWS_REGION,
         config=Config(read_timeout=300),
     )
 
-    body = json.dumps({
+    payload = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 65536,
+        "max_tokens": 64000,
         "system": SYSTEM_PROMPT,
         "messages": [
             {
                 "role": "user",
-                "content": (
-                    f"Customer/Meeting: {customer_name}\n\n"
-                    f"Raw Transcript:\n{transcript}"
-                ),
+                "content": f"Customer/Meeting: {customer_name}\n\nRaw Transcript:\n{transcript}",
             }
         ],
-    })
-
+    }
     response = client.invoke_model_with_response_stream(
         modelId=CLAUDE_MODEL_ID,
         contentType="application/json",
         accept="application/json",
-        body=body,
+        body=json.dumps(payload),
     )
 
     full_text = []

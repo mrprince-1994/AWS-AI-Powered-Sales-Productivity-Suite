@@ -114,7 +114,7 @@ Speaker 1: Perfect. Talk to everyone soon. Bye.
 """.strip()
 
 # Repeat the transcript to simulate a longer call
-LONG_TRANSCRIPT = "\n\n".join([FAKE_TRANSCRIPT] * 3)
+LONG_TRANSCRIPT = "\n\n".join([FAKE_TRANSCRIPT] * 5)
 
 print(f"Transcript length: {len(LONG_TRANSCRIPT)} characters, ~{len(LONG_TRANSCRIPT.split())} words")
 print("Sending to Claude for note generation (streaming)...\n")
