@@ -32,11 +32,18 @@ def _ensure_table():
                 {"AttributeName": "timestamp",    "AttributeType": "S"},
             ],
             BillingMode="PAY_PER_REQUEST",
-            TimeToLiveSpecification={"Enabled": True, "AttributeName": "expiry_ttl"},
         )
         # Wait until active
         waiter = client.get_waiter("table_exists")
         waiter.wait(TableName=TABLE_NAME)
+        # Enable TTL (separate API call)
+        try:
+            client.update_time_to_live(
+                TableName=TABLE_NAME,
+                TimeToLiveSpecification={"Enabled": True, "AttributeName": "expiry_ttl"},
+            )
+        except Exception:
+            pass  # TTL is nice-to-have, don't fail if it errors
 
 
 def save_chat_session(
