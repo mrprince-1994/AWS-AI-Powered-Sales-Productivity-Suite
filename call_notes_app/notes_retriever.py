@@ -325,8 +325,10 @@ def ask_notes_agent(
 
             if RETRIEVAL_AGENT_ARN:
                 if on_chunk:
-                    on_chunk("🔍 Querying retrieval agent...\n\n")
+                    on_chunk("🔍 Querying retrieval agent...")
                 payload = {"prompt": question, "file_index": file_index}
+                if on_chunk:
+                    on_chunk(f"📂 Sending {len(file_index)} files to agent...")
                 answer = _invoke_agentcore(RETRIEVAL_AGENT_ARN, payload)
                 if on_chunk:
                     on_chunk(answer)
