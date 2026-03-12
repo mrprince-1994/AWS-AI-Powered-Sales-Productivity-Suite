@@ -1,0 +1,4 @@
+bedrock-agentcore
+strands-agents
+python-docx
+boto3>=1.35.0

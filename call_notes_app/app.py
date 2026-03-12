@@ -9,7 +9,7 @@ from history import save_session, list_sessions, get_all_customers
 from question_detector import is_aws_aiml_question, extract_question
 from agent_client import ask_agent, warmup as warmup_agent, shutdown as shutdown_agent
 from md_render import configure_tags, MarkdownStreamer
-from notes_retriever import scan_notes, ask_notes_agent, NOTE_SOURCES
+from notes_retriever import scan_notes, ask_notes_agent, ask_research_agent, NOTE_SOURCES, dedupe_customers
 
 # --- Color Palette ---
 BG_DARK = "#0f0f1a"
@@ -628,10 +628,11 @@ class NotesRetrieverTab:
 
     def __init__(self, parent):
         self._notes_meta = []
-        self._conversation_history = []   # grows with each turn
+        self._conversation_history = []
         self._streaming_started = False
         self._md_streamer = None
         self._is_responding = False
+        self._agent_mode = "retrieval"   # "retrieval" | "research"
         self._build_ui(parent)
         threading.Thread(target=self._refresh_index, daemon=True).start()
 
@@ -658,7 +659,26 @@ class NotesRetrieverTab:
             border_width=1, border_color=BORDER, corner_radius=6,
             font=ctk.CTkFont("Segoe UI", 11),
             command=lambda: threading.Thread(target=self._refresh_index, daemon=True).start())
-        self.refresh_btn.pack(side=tk.RIGHT)
+        self.refresh_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # Agent mode toggle — Retrieval ↔ Research
+        toggle_frame = ctk.CTkFrame(top, fg_color=BG_CARD, corner_radius=8,
+                                     border_width=1, border_color=BORDER)
+        toggle_frame.pack(side=tk.RIGHT, padx=(0, 12))
+        self._retrieval_btn = ctk.CTkButton(
+            toggle_frame, text="📋 Notes Retrieval", width=140, height=28,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=BG_DARK,
+            corner_radius=6, border_width=0,
+            font=ctk.CTkFont("Segoe UI", 11, "bold"),
+            command=lambda: self._set_agent_mode("retrieval"))
+        self._retrieval_btn.pack(side=tk.LEFT, padx=3, pady=3)
+        self._research_btn = ctk.CTkButton(
+            toggle_frame, text="🌐 Customer Research", width=150, height=28,
+            fg_color="transparent", hover_color=BG_INPUT, text_color=FG_DIM,
+            corner_radius=6, border_width=0,
+            font=ctk.CTkFont("Segoe UI", 11),
+            command=lambda: self._set_agent_mode("research"))
+        self._research_btn.pack(side=tk.LEFT, padx=(0, 3), pady=3)
 
         # Clickable index summary — click to expand/collapse the index panel
         self.index_label = ctk.CTkLabel(
@@ -779,8 +799,9 @@ class NotesRetrieverTab:
             chat_header, text="New conversation",
             text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
         self.turn_label.pack(side=tk.LEFT, padx=(10, 0))
-        ctk.CTkLabel(chat_header, text="Claude Opus 4.6  ·  Bedrock",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.RIGHT)
+        self.model_label = ctk.CTkLabel(chat_header, text="📋 Notes Retrieval  ·  Claude Opus 4.6  ·  Bedrock",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
+        self.model_label.pack(side=tk.RIGHT)
 
         # Chat display
         self.chat_text = StyledText(chat_outer, font=("Segoe UI", 10))
@@ -818,6 +839,25 @@ class NotesRetrieverTab:
         self.send_btn.grid(row=0, column=1, padx=(0, 10), pady=8)
 
     # ── Actions ──
+
+    def _set_agent_mode(self, mode: str):
+        """Switch between 'retrieval' and 'research' agent modes."""
+        self._agent_mode = mode
+        if mode == "retrieval":
+            self._retrieval_btn.configure(fg_color=ACCENT, text_color=BG_DARK,
+                                           font=ctk.CTkFont("Segoe UI", 11, "bold"))
+            self._research_btn.configure(fg_color="transparent", text_color=FG_DIM,
+                                          font=ctk.CTkFont("Segoe UI", 11))
+            self.model_label.configure(text="📋 Notes Retrieval  ·  Claude Opus 4.6  ·  Bedrock")
+            self.input_entry.configure(placeholder_text="Ask about your historical call notes...")
+        else:
+            self._research_btn.configure(fg_color=YELLOW, text_color=BG_DARK,
+                                          font=ctk.CTkFont("Segoe UI", 11, "bold"))
+            self._retrieval_btn.configure(fg_color="transparent", text_color=FG_DIM,
+                                           font=ctk.CTkFont("Segoe UI", 11))
+            self.model_label.configure(text="🌐 Customer Research  ·  Claude Sonnet 4.6  ·  Web Search")
+            self.input_entry.configure(placeholder_text="Research a customer (e.g. 'What's new with BQE?')...")
+        self._new_chat()
 
     def _toggle_index_panel(self):
         if self._index_panel_visible:
@@ -912,11 +952,16 @@ class NotesRetrieverTab:
         self.send_btn.configure(state=tk.DISABLED, text="...")
 
         # Render user bubble
+        thinking_msg = (
+            "⏳ Reading notes and thinking..."
+            if self._agent_mode == "retrieval"
+            else "🌐 Searching the web..."
+        )
         self.chat_text.config(state=tk.NORMAL)
         self.chat_text.insert(tk.END, "You\n", "user_label")
         self.chat_text.insert(tk.END, f"{question}\n\n", "user_msg")
         self.chat_text.insert(tk.END, "Assistant\n", "assistant_label")
-        self.chat_text.insert(tk.END, "⏳ Reading notes and thinking...\n", "status")
+        self.chat_text.insert(tk.END, f"{thinking_msg}\n", "status")
         self.chat_text.see(tk.END)
         self.chat_text.config(state=tk.DISABLED)
 
@@ -929,21 +974,38 @@ class NotesRetrieverTab:
         def on_done(answer, error):
             self.chat_text.after(0, self._finish, error)
 
-        ask_notes_agent(
-            question,
-            self._get_active_notes(),
-            self._conversation_history,
-            on_chunk=on_chunk,
-            callback=on_done,
-        )
+        if self._agent_mode == "retrieval":
+            ask_notes_agent(
+                question,
+                self._get_active_notes(),
+                self._conversation_history,
+                on_chunk=on_chunk,
+                callback=on_done,
+            )
+        else:
+            customer = self.customer_filter_var.get()
+            if customer == "(All)":
+                customer = ""
+            ask_research_agent(
+                question,
+                customer,
+                self._conversation_history,
+                on_chunk=on_chunk,
+                callback=on_done,
+            )
 
     def _append_chunk(self, text):
         self.chat_text.config(state=tk.NORMAL)
         if not self._streaming_started:
             self._streaming_started = True
-            pos = self.chat_text.search("⏳ Reading notes and thinking...", "1.0", tk.END)
-            if pos:
-                self.chat_text.delete(pos, f"{pos} lineend+1c")
+            for thinking_msg in ["⏳ Reading notes and thinking...",
+                                  "🌐 Searching the web...",
+                                  "🔍 Querying retrieval agent...",
+                                  "🌐 Querying research agent..."]:
+                pos = self.chat_text.search(thinking_msg, "1.0", tk.END)
+                if pos:
+                    self.chat_text.delete(pos, f"{pos} lineend+1c")
+                    break
         self._md_streamer.feed(text)
         self.chat_text.see(tk.END)
         self.chat_text.config(state=tk.DISABLED)

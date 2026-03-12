@@ -1,24 +1,24 @@
-"""Retrieval agent for historical call notes (.docx and .md files).
+"""Retrieval agent client for historical call notes.
 
-Uses an agentic tool-use loop:
-  1. Build a lightweight index of all files (filename, customer, date, source, path)
-  2. Send the index + user question to Claude Opus 4.6 with a `read_note_file` tool
-  3. Claude calls the tool for whichever files it needs — we read and return them
-  4. Loop until Claude stops calling tools and produces a final answer
+Sends a file index + question to the deployed AgentCore retrieval agent.
+Falls back to direct Bedrock tool-use if the ARN is not configured.
 
-This avoids dumping all file content upfront and scales to large note collections.
-The 1M context window beta header is included so Claude can handle large reads.
+Scan / index logic lives here; the actual LLM reasoning runs in the agent.
 """
 import json
 import os
+import re
 import threading
 import boto3
 from botocore.config import Config
-from docx import Document
-import re
 from config import AWS_REGION, NOTES_BASE_DIR, SANGHWA_NOTES_DIR, AYMAN_NOTES_DIR
 
-OPUS_MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
+# ARN of the deployed retrieval agent (set via env var after agentcore launch)
+RETRIEVAL_AGENT_ARN = os.environ.get("RETRIEVAL_AGENT_ARN", "")
+RESEARCH_AGENT_ARN  = os.environ.get("RESEARCH_AGENT_ARN", "")
+
+OPUS_MODEL_ID   = "us.anthropic.claude-opus-4-6-v1"
+SONNET_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 
 NOTE_SOURCES = [
     (NOTES_BASE_DIR,    "My Notes"),
@@ -26,50 +26,7 @@ NOTE_SOURCES = [
     (AYMAN_NOTES_DIR,   "Ayman"),
 ]
 
-# Beta flag to unlock the 1M token context window
-CONTEXT_1M_BETA = "context-1m-2025-08-07"
-
-RETRIEVAL_SYSTEM_PROMPT = """You are an expert assistant that retrieves and synthesizes \
-information from historical customer call notes.
-
-You have access to a `read_note_file` tool. Use it to read the content of specific note files.
-
-Workflow:
-1. You will receive an index of all available note files (filename, customer, source, date, file_id)
-2. Based on the user's question, identify which files are relevant by their filename/customer/date
-3. Call `read_note_file` with the file_id(s) of the relevant files to read their content
-4. Synthesize the content and answer the user's question
-
-Guidelines:
-- Always cite the customer name, filename, and source (My Notes / Sanghwa / Ayman)
-- Be specific: include names, dates, numbers, action items, and commitments from the notes
-- If multiple files are relevant, read all of them before answering
-- Format responses in clean markdown with clear sections
-- Remember context from earlier in the conversation for follow-up questions
-- If no files seem relevant to the question, say so and list what customers ARE available"""
-
-# Tool definition for Claude
-READ_NOTE_TOOL = {
-    "name": "read_note_file",
-    "description": (
-        "Read the full text content of a specific call note file. "
-        "Use the file_id from the index provided in the conversation. "
-        "Call this for each file you need to read before answering."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "file_id": {
-                "type": "string",
-                "description": "The file_id from the note index (e.g. 'file_0', 'file_1', ...)"
-            }
-        },
-        "required": ["file_id"]
-    }
-}
-
-
-# ── Filename patterns ──────────────────────────────────────────────────────────
+# ── Filename helpers ───────────────────────────────────────────────────────────
 
 _SA_FILENAME_RE = re.compile(
     r"^\[[\d_]+\](?:\[.*?\])?\s*(.+?)\s*(?:-\s*.+)?\.(?:docx|md)$",
@@ -81,43 +38,52 @@ def _customer_from_filename(fname: str) -> str | None:
     m = _SA_FILENAME_RE.match(fname)
     if not m:
         return None
-    raw = m.group(1)
-    customer = raw.split(" - ")[0].strip()
-    return customer if customer else None
+    return m.group(1).split(" - ")[0].strip() or None
 
 
 def _date_from_sa_filename(fname: str) -> str:
     m = re.match(r"^\[(\d{2})_(\d{2})\]", fname)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    return ""
+    return f"{m.group(1)}-{m.group(2)}" if m else ""
 
 
-# ── File reading ───────────────────────────────────────────────────────────────
+# ── Customer deduplication ─────────────────────────────────────────────────────
 
-def _read_docx_text(filepath: str) -> str:
-    try:
-        doc = Document(filepath)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    except Exception as e:
-        return f"[Error reading .docx: {e}]"
-
-
-def _read_md_text(filepath: str) -> str:
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except Exception as e:
-        return f"[Error reading .md: {e}]"
+def _normalize_customer(name: str) -> str:
+    s = name.lower()
+    s = re.sub(r"[^\w\s]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"es$", "", s)
+    s = re.sub(r"s$", "", s)
+    return s
 
 
-def _read_file(filepath: str) -> str:
-    if filepath.lower().endswith(".docx"):
-        return _read_docx_text(filepath)
-    return _read_md_text(filepath)
+def dedupe_customers(names: list[str]) -> dict[str, str]:
+    """Return {original_name: canonical_name} merging near-duplicates."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        groups.setdefault(_normalize_customer(name), []).append(name)
+
+    keys = sorted(groups.keys())
+    merged: dict[str, str] = {}
+    for i, k in enumerate(keys):
+        if k in merged:
+            continue
+        for k2 in keys[i + 1:]:
+            if k2 in merged:
+                continue
+            if k2.startswith(k) and len(k2) - len(k) <= 3:
+                merged[k2] = k
+                groups[k].extend(groups.pop(k2, []))
+
+    canonical_map: dict[str, str] = {}
+    for key, orig_names in groups.items():
+        canonical = min(orig_names, key=lambda n: (len(n), n.lower()))
+        for orig in orig_names:
+            canonical_map[orig] = canonical
+    return canonical_map
 
 
-# ── Index scanning ─────────────────────────────────────────────────────────────
+# ── Directory scanning ─────────────────────────────────────────────────────────
 
 def scan_notes(sources: list[tuple[str, str]] | None = None) -> list[dict]:
     """Scan directories recursively for .docx and .md note files."""
@@ -142,7 +108,7 @@ def scan_notes(sources: list[tuple[str, str]] | None = None) -> list[dict]:
                 if not customer:
                     parts = rel.replace("\\", "/").split("/")
                     customer = parts[0] if parts[0] != "." else os.path.splitext(fname)[0]
-                    for p in fname.replace(".docx", "").replace(".md", "").split("_"):
+                    for p in re.sub(r"\.(docx|md)$", "", fname, flags=re.I).split("_"):
                         if len(p) == 10 and p.count("-") == 2:
                             date_str = p
                             break
@@ -154,86 +120,200 @@ def scan_notes(sources: list[tuple[str, str]] | None = None) -> list[dict]:
                     "date": date_str,
                     "source": source_label,
                 })
-
     return notes
 
 
-def _normalize_customer(name: str) -> str:
-    """Normalize a customer name for fuzzy comparison.
+# ── Index helpers ──────────────────────────────────────────────────────────────
 
-    Lowercases, strips punctuation, collapses whitespace, and removes
-    common trailing plurals (s, es) so 'Common Chain' and 'Common Chains'
-    map to the same key.
-    """
-    s = name.lower()
-    s = re.sub(r"[^\w\s]", "", s)   # strip punctuation
-    s = re.sub(r"\s+", " ", s).strip()
-    # Strip trailing plural suffixes
-    s = re.sub(r"es$", "", s)
-    s = re.sub(r"s$", "", s)
-    return s
+def _build_file_index(notes_meta: list[dict], question: str = "") -> list[dict]:
+    """Sort by relevance and return a serialisable index list (no filepath for remote)."""
+    q_lower = question.lower()
+    q_words = set(w for w in q_lower.split() if len(w) > 3)
+
+    def _relevance(n):
+        cust = n["customer"].lower()
+        if cust in q_lower:
+            return 0
+        if any(w in cust for w in q_words):
+            return 1
+        return 2
+
+    sorted_notes = sorted(notes_meta, key=_relevance)[:200]
+    return [
+        {
+            "file_id":  f"file_{i}",
+            "customer": n["customer"],
+            "source":   n.get("source", "?"),
+            "filename": n["filename"],
+            "date":     n.get("date", ""),
+            "filepath": n["filepath"],   # needed by local fallback & agent on same machine
+        }
+        for i, n in enumerate(sorted_notes)
+    ]
 
 
-def dedupe_customers(names: list[str]) -> dict[str, str]:
-    """Group near-duplicate customer names and return a canonical name for each.
+# ── AgentCore invocation ───────────────────────────────────────────────────────
 
-    Returns a mapping of {original_name: canonical_name} where the canonical
-    name is the shortest/simplest variant in each group (usually the singular).
+def _invoke_agentcore(runtime_arn: str, payload: dict) -> str:
+    """Call a deployed AgentCore agent and return the answer text."""
+    import websocket as ws_lib
+    from bedrock_agentcore.runtime import AgentCoreRuntimeClient
 
-    Two names are considered duplicates when their normalized forms are identical
-    OR when one normalized form is a prefix of the other (handles 'BQE' vs 'BQE Core').
-    """
-    # Build groups: normalized_key → list of original names
-    groups: dict[str, list[str]] = {}
-    for name in names:
-        key = _normalize_customer(name)
-        groups.setdefault(key, []).append(name)
+    client = AgentCoreRuntimeClient(region=AWS_REGION)
+    ws_url, headers = client.generate_ws_connection(
+        runtime_arn=runtime_arn,
+        endpoint_name="DEFAULT",
+    )
+    header_list = [f"{k}: {v}" for k, v in headers.items()]
+    ws = ws_lib.create_connection(ws_url, header=header_list, timeout=300)
+    parts = []
+    try:
+        ws.send(json.dumps(payload))
+        while True:
+            try:
+                raw = ws.recv()
+            except ws_lib.WebSocketConnectionClosedException:
+                break
+            if not raw:
+                break
+            try:
+                data = json.loads(raw)
+                text = data.get("answer", data.get("result", data.get("text", "")))
+                if text:
+                    parts.append(text)
+            except json.JSONDecodeError:
+                parts.append(raw)
+    finally:
+        ws.close()
+    return "".join(parts)
 
-    # Also merge groups where one key is a prefix of another
-    # e.g. 'common chain' and 'common chains' both normalize to 'common chain'
-    # but also handle 'bqe' vs 'bqe core' → keep separate (prefix only merges if diff <= 3 chars)
-    keys = sorted(groups.keys())
-    merged: dict[str, str] = {}  # key → canonical_key
-    for i, k in enumerate(keys):
-        if k in merged:
-            continue
-        for j in range(i + 1, len(keys)):
-            k2 = keys[j]
-            if k2 in merged:
-                continue
-            # Merge if one is a prefix of the other AND the suffix is short (≤3 chars)
-            if k2.startswith(k) and len(k2) - len(k) <= 3:
-                merged[k2] = k
-                groups[k].extend(groups.pop(k2, []))
 
-    # For each group, pick the canonical name: prefer shortest, then alphabetically first
-    canonical_map: dict[str, str] = {}
-    for key, orig_names in groups.items():
-        canonical = min(orig_names, key=lambda n: (len(n), n.lower()))
-        for orig in orig_names:
-            canonical_map[orig] = canonical
+# ── Local fallback (direct Bedrock tool-use) ───────────────────────────────────
 
-    return canonical_map
-    """Build a compact index string listing available files.
+def _local_retrieval(question: str, file_index: list[dict], conversation_history: list[dict],
+                     on_chunk=None) -> str:
+    """Direct Bedrock tool-use loop — used when RETRIEVAL_AGENT_ARN is not set."""
+    from docx import Document as _DocxDocument
 
-    Caps at max_entries to keep the index prompt manageable.
-    Files are assumed to be pre-sorted by relevance by the caller.
-    """
-    total = len(notes_meta)
-    shown = notes_meta[:max_entries]
-    lines = [f"Available note files ({total} total, showing {len(shown)}):\n"]
-    for i, note in enumerate(shown):
-        lines.append(
-            f"  file_{i}: [{note.get('source','?')}] customer={note['customer']} "
-            f"date={note['date'] or 'unknown'} filename={note['filename']}"
+    READ_TOOL = {
+        "name": "read_note_file",
+        "description": "Read the full text of a call note file by file_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"file_id": {"type": "string"}},
+            "required": ["file_id"],
+        },
+    }
+
+    file_map = {e["file_id"]: e for e in file_index}
+
+    def _read(entry):
+        fp = entry.get("filepath", "")
+        if not fp or not os.path.isfile(fp):
+            return f"File not found: {fp}"
+        try:
+            if fp.lower().endswith(".docx"):
+                doc = _DocxDocument(fp)
+                return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception as e:
+            return f"Error: {e}"
+
+    index_lines = "\n".join(
+        f"  {e['file_id']}: [{e.get('source','?')}] customer={e['customer']} "
+        f"date={e.get('date') or 'unknown'} filename={e['filename']}"
+        for e in file_index
+    )
+
+    if not conversation_history:
+        user_content = f"Available files ({len(file_index)}):\n{index_lines}\n\n---\n\n{question}"
+    else:
+        user_content = question
+
+    conversation_history.append({"role": "user", "content": user_content})
+
+    client = boto3.client("bedrock-runtime", region_name=AWS_REGION,
+                          config=Config(read_timeout=300))
+    answer_parts = []
+
+    for _ in range(10):
+        payload = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 8192,
+            "system": (
+                "You are a retrieval assistant for historical call notes. "
+                "Use read_note_file to fetch files, then answer the question. "
+                "Cite customer, source, and filename in your answer."
+            ),
+            "messages": conversation_history,
+            "tools": [READ_TOOL],
+        }
+        resp = client.invoke_model_with_response_stream(
+            modelId=OPUS_MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(payload),
         )
-    if total > max_entries:
-        lines.append(f"\n  ... and {total - max_entries} more files not shown. "
-                     f"Use the Customer filter in the UI to narrow results.")
-    return "\n".join(lines)
+
+        blocks, cur = [], None
+        for event in resp["body"]:
+            chunk = json.loads(event["chunk"]["bytes"])
+            t = chunk.get("type")
+            if t == "content_block_start":
+                cur = {**chunk.get("content_block", {}), "_tp": [], "_ip": []}
+            elif t == "content_block_delta":
+                d = chunk.get("delta", {})
+                if d.get("type") == "text_delta":
+                    txt = d.get("text", "")
+                    if txt:
+                        cur["_tp"].append(txt)
+                        answer_parts.append(txt)
+                        if on_chunk:
+                            on_chunk(txt)
+                elif d.get("type") == "input_json_delta":
+                    cur["_ip"].append(d.get("partial_json", ""))
+            elif t == "content_block_stop" and cur:
+                if cur.get("type") == "text":
+                    cur["text"] = "".join(cur["_tp"])
+                elif cur.get("type") == "tool_use":
+                    raw = "".join(cur["_ip"])
+                    cur["input"] = json.loads(raw) if raw.strip() else {}
+                cur.pop("_tp", None); cur.pop("_ip", None)
+                blocks.append(cur)
+                cur = None
+            elif t == "error":
+                raise RuntimeError(f"API error: {chunk}")
+
+        conversation_history.append({"role": "assistant", "content": blocks})
+
+        tool_blocks = [b for b in blocks if b.get("type") == "tool_use"]
+        if not tool_blocks:
+            break
+
+        tool_results = []
+        for tb in tool_blocks:
+            fid = tb.get("input", {}).get("file_id", "")
+            entry = file_map.get(fid)
+            content = (
+                f"=== {entry['customer']} | {entry['source']} | "
+                f"{entry['filename']} | {entry.get('date') or 'no date'} ===\n\n"
+                + _read(entry)
+            ) if entry else f"file_id '{fid}' not found."
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tb["id"],
+                "content": content,
+            })
+            if on_chunk:
+                on_chunk(f"📂 Reading: {entry['filename'] if entry else fid}\n\n")
+
+        conversation_history.append({"role": "user", "content": tool_results})
+
+    return "".join(answer_parts)
 
 
-# ── Agentic retrieval loop ─────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def ask_notes_agent(
     question: str,
@@ -242,195 +322,135 @@ def ask_notes_agent(
     on_chunk=None,
     callback=None,
 ):
-    """Multi-turn agentic retrieval using tool use.
+    """Ask the retrieval agent about historical notes.
 
-    On the first turn, injects a file index. Claude then calls read_note_file
-    for whichever files it needs. We execute the tool calls and loop until
-    Claude produces a final text response.
+    Uses the deployed AgentCore agent if RETRIEVAL_AGENT_ARN is set,
+    otherwise falls back to direct Bedrock tool-use.
     """
-
     def _run():
         try:
             if not notes_meta:
                 msg = (
-                    "No call notes found in the configured directories.\n\n"
+                    "No call notes found.\n\n"
                     f"- My Notes: `{NOTES_BASE_DIR}`\n"
                     f"- Sanghwa: `{SANGHWA_NOTES_DIR}`\n"
-                    f"- Ayman: `{AYMAN_NOTES_DIR}`\n\n"
-                    "Make sure at least one directory exists and contains .docx or .md files."
+                    f"- Ayman: `{AYMAN_NOTES_DIR}`"
                 )
-                if on_chunk:
-                    on_chunk(msg)
-                if callback:
-                    callback(msg, None)
+                if on_chunk: on_chunk(msg)
+                if callback: callback(msg, None)
                 return
 
-            # Build file_id → metadata map
-            # Sort by relevance to the question so matching files get low IDs
-            # and are within the index cap
-            q_lower = question.lower()
-            q_words = set(q_lower.split())
+            file_index = _build_file_index(notes_meta, question)
 
-            def _relevance(n):
-                cust = n["customer"].lower()
-                if cust in q_lower:
-                    return 0  # exact customer name in question
-                if any(w in cust for w in q_words if len(w) > 3):
-                    return 1  # partial word match
-                return 2
-
-            sorted_notes = sorted(notes_meta, key=_relevance)
-            file_map = {f"file_{i}": note for i, note in enumerate(sorted_notes)}
-
-            # First turn: inject the index
-            if not conversation_history:
-                index_text = _build_index_text(sorted_notes)
-                user_content = f"{index_text}\n\n---\n\n{question}"
-            else:
-                user_content = question
-
-            conversation_history.append({"role": "user", "content": user_content})
-
-            client = boto3.client(
-                "bedrock-runtime",
-                region_name=AWS_REGION,
-                config=Config(read_timeout=300),
-            )
-
-            # Agentic loop — keep going while Claude calls tools
-            final_answer_parts = []
-            MAX_TOOL_ROUNDS = 10
-
-            for _round in range(MAX_TOOL_ROUNDS):
-                payload = {
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 8192,
-                    "system": RETRIEVAL_SYSTEM_PROMPT,
-                    "messages": conversation_history,
-                    "tools": [READ_NOTE_TOOL],
-                }
-
-                # Stream the response
-                response = client.invoke_model_with_response_stream(
-                    modelId=OPUS_MODEL_ID,
-                    contentType="application/json",
-                    accept="application/json",
-                    body=json.dumps(payload),
-                )
-
-                # Collect the full response, streaming text chunks as they arrive
-                content_blocks = []
-                current_block = None
-                stop_reason = None
-
-                for event in response["body"]:
-                    chunk = json.loads(event["chunk"]["bytes"])
-                    etype = chunk.get("type")
-
-                    if etype == "message_start":
-                        pass
-
-                    elif etype == "content_block_start":
-                        current_block = chunk.get("content_block", {})
-                        current_block["_text_parts"] = []
-                        current_block["_input_parts"] = []
-
-                    elif etype == "content_block_delta":
-                        delta = chunk.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                current_block["_text_parts"].append(text)
-                                final_answer_parts.append(text)
-                                if on_chunk:
-                                    on_chunk(text)
-                        elif delta.get("type") == "input_json_delta":
-                            current_block["_input_parts"].append(
-                                delta.get("partial_json", ""))
-
-                    elif etype == "content_block_stop":
-                        if current_block:
-                            if current_block.get("type") == "text":
-                                current_block["text"] = "".join(
-                                    current_block["_text_parts"])
-                            elif current_block.get("type") == "tool_use":
-                                raw_input = "".join(current_block["_input_parts"])
-                                current_block["input"] = json.loads(raw_input) if raw_input.strip() else {}
-                            current_block.pop("_text_parts", None)
-                            current_block.pop("_input_parts", None)
-                            content_blocks.append(current_block)
-                        current_block = None
-
-                    elif etype == "message_delta":
-                        stop_reason = chunk.get("delta", {}).get("stop_reason")
-
-                    elif etype == "error":
-                        # Surface API-level errors (e.g. unsupported beta flag)
-                        raise RuntimeError(f"API error: {chunk}")
-
-                # Append assistant turn to history
-                conversation_history.append({
-                    "role": "assistant",
-                    "content": content_blocks,
-                })
-
-                # If no tool calls, we're done
-                tool_use_blocks = [b for b in content_blocks if b.get("type") == "tool_use"]
-                if not tool_use_blocks:
-                    break
-
-                # Notify user which files are being read
-                file_names = []
-                for tb in tool_use_blocks:
-                    fid = tb.get("input", {}).get("file_id", "")
-                    note = file_map.get(fid)
-                    if note:
-                        file_names.append(note["filename"])
-                if file_names and on_chunk:
-                    on_chunk(f"📂 Reading: {', '.join(file_names)}\n\n")
-
-                # Execute tool calls and build tool_result turn
-                tool_results = []
-                for tb in tool_use_blocks:
-                    file_id = tb.get("input", {}).get("file_id", "")
-                    note = file_map.get(file_id)
-                    if note:
-                        content = _read_file(note["filepath"])
-                        result_text = (
-                            f"=== {note['customer']} | {note['source']} | "
-                            f"{note['filename']} | {note['date'] or 'no date'} ===\n\n"
-                            f"{content}"
-                        )
-                    else:
-                        result_text = f"Error: file_id '{file_id}' not found in index."
-
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tb["id"],
-                        "content": result_text,
-                    })
-
-                conversation_history.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
-
-            answer = "".join(final_answer_parts)
-            if not answer.strip():
-                answer = "⚠️ No response generated. The model may have only used tools without producing a final answer. Try rephrasing your question."
+            if RETRIEVAL_AGENT_ARN:
+                if on_chunk:
+                    on_chunk("🔍 Querying retrieval agent...\n\n")
+                payload = {"prompt": question, "file_index": file_index}
+                answer = _invoke_agentcore(RETRIEVAL_AGENT_ARN, payload)
                 if on_chunk:
                     on_chunk(answer)
-            if callback:
-                callback(answer, None)
+                # Keep history consistent for multi-turn
+                conversation_history.append({"role": "user", "content": question})
+                conversation_history.append({"role": "assistant", "content": answer})
+            else:
+                answer = _local_retrieval(question, file_index, conversation_history,
+                                          on_chunk=on_chunk)
+
+            if not answer.strip():
+                answer = "⚠️ No response generated. Try rephrasing your question."
+                if on_chunk: on_chunk(answer)
+
+            if callback: callback(answer, None)
 
         except Exception as e:
             if conversation_history and conversation_history[-1]["role"] == "user":
                 conversation_history.pop()
             import traceback
-            err = f"Error querying notes: {e}\n\n```\n{traceback.format_exc()}\n```"
-            if on_chunk:
-                on_chunk(err)
-            if callback:
-                callback(None, str(e))
+            err = f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
+            if on_chunk: on_chunk(err)
+            if callback: callback(None, str(e))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def ask_research_agent(
+    question: str,
+    customer: str,
+    conversation_history: list[dict],
+    on_chunk=None,
+    callback=None,
+):
+    """Ask the customer research agent (web search).
+
+    Uses the deployed AgentCore research agent if RESEARCH_AGENT_ARN is set,
+    otherwise falls back to direct Bedrock (no web search tools).
+    """
+    def _run():
+        try:
+            if RESEARCH_AGENT_ARN:
+                if on_chunk:
+                    on_chunk("🌐 Querying research agent...\n\n")
+                payload = {"prompt": question, "customer": customer}
+                answer = _invoke_agentcore(RESEARCH_AGENT_ARN, payload)
+                if on_chunk:
+                    on_chunk(answer)
+                conversation_history.append({"role": "user", "content": question})
+                conversation_history.append({"role": "assistant", "content": answer})
+            else:
+                # Fallback: Bedrock without web search
+                if not conversation_history:
+                    user_content = (
+                        f"You are a customer research assistant. The customer is: {customer}\n\n"
+                        f"{question}\n\n"
+                        "(Note: web search tools are not available in this mode. "
+                        "Answer from your training knowledge and note any limitations.)"
+                    )
+                else:
+                    user_content = question
+
+                conversation_history.append({"role": "user", "content": user_content})
+
+                client = boto3.client("bedrock-runtime", region_name=AWS_REGION,
+                                      config=Config(read_timeout=120))
+                payload_body = {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 4096,
+                    "system": (
+                        "You are an expert customer research analyst helping an AWS account manager. "
+                        "Provide structured research briefs covering company overview, recent news, "
+                        "tech stack, AWS relevance, and talking points."
+                    ),
+                    "messages": conversation_history,
+                }
+                resp = client.invoke_model_with_response_stream(
+                    modelId=SONNET_MODEL_ID,
+                    contentType="application/json",
+                    accept="application/json",
+                    body=json.dumps(payload_body),
+                )
+                parts = []
+                for event in resp["body"]:
+                    chunk = json.loads(event["chunk"]["bytes"])
+                    if chunk.get("type") == "content_block_delta":
+                        txt = chunk["delta"].get("text", "")
+                        if txt:
+                            parts.append(txt)
+                            if on_chunk: on_chunk(txt)
+                answer = "".join(parts)
+                conversation_history.append({"role": "assistant", "content": answer})
+
+            if not answer.strip():
+                answer = "⚠️ No response generated."
+                if on_chunk: on_chunk(answer)
+
+            if callback: callback(answer, None)
+
+        except Exception as e:
+            if conversation_history and conversation_history[-1]["role"] == "user":
+                conversation_history.pop()
+            import traceback
+            err = f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
+            if on_chunk: on_chunk(err)
+            if callback: callback(None, str(e))
 
     threading.Thread(target=_run, daemon=True).start()
