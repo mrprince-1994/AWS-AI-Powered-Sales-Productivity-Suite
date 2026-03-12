@@ -1,7 +1,7 @@
-"""AgentCore Runtime — Historical Notes Retrieval Agent.
+"""AgentCore Runtime — Historical Notes Retrieval Agent (streaming).
 
 Built with Strands. Receives a file index + question, calls read_note_file
-tool to fetch relevant files, then synthesizes an answer.
+tool to fetch relevant files, then streams the answer back via SSE.
 
 Payload schema:
   {
@@ -43,12 +43,13 @@ app = BedrockAgentCoreApp()
 
 
 @app.entrypoint
-def retrieve_notes(payload, context):
+async def retrieve_notes(payload, context):
     question = payload.get("prompt", "")
     file_index = payload.get("file_index", [])
 
     if not question:
-        return {"answer": "No question provided.", "status": "error"}
+        yield {"text": "No question provided.", "type": "error"}
+        return
 
     # Build file_id → metadata + content lookup
     file_map: dict[str, dict] = {entry["file_id"]: entry for entry in file_index}
@@ -97,22 +98,15 @@ def retrieve_notes(payload, context):
             system_prompt=SYSTEM_PROMPT,
             tools=[read_note_file],
             model=OPUS_MODEL_ID,
+            callback_handler=None,
         )
 
-        result = agent(f"{index_text}\n\n---\n\n{question}")
-
-        answer = ""
-        if hasattr(result, "message") and isinstance(result.message, dict):
-            for block in result.message.get("content", []):
-                if isinstance(block, dict) and "text" in block:
-                    answer += block["text"]
-        else:
-            answer = str(result)
-
-        return {"answer": answer, "status": "success"}
+        stream = agent.stream_async(f"{index_text}\n\n---\n\n{question}")
+        async for event in stream:
+            yield event
 
     except Exception as e:
-        return {"answer": f"Error: {e}", "status": "error"}
+        yield {"text": f"Error: {e}", "type": "error"}
 
 
 if __name__ == "__main__":

@@ -148,10 +148,14 @@ def _build_file_index(notes_meta: list[dict], question: str = "") -> list[dict]:
     ]
 
 
-# ── AgentCore invocation ───────────────────────────────────────────────────────
+# ── AgentCore invocation (streaming SSE) ───────────────────────────────────────
 
-def _invoke_agentcore(runtime_arn: str, payload: dict) -> str:
-    """Call a deployed AgentCore agent via boto3 invoke_agent_runtime (HTTP)."""
+def _invoke_agentcore(runtime_arn: str, payload: dict, on_chunk=None) -> str:
+    """Call a deployed AgentCore agent via boto3 invoke_agent_runtime (HTTP).
+
+    The agent streams SSE events. Each line is `data: <json>\n\n`.
+    We parse text deltas from Strands stream events and forward them to on_chunk.
+    """
     client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
     resp = client.invoke_agent_runtime(
         agentRuntimeArn=runtime_arn,
@@ -162,11 +166,59 @@ def _invoke_agentcore(runtime_arn: str, payload: dict) -> str:
     if hasattr(body, "read"):
         body = body.read()
     raw = body.decode("utf-8") if isinstance(body, bytes) else body
-    try:
-        data = json.loads(raw)
-        return data.get("answer", data.get("result", data.get("text", raw)))
-    except json.JSONDecodeError:
-        return raw
+
+    # Parse SSE stream: lines like  data: {"data":"...","type":"..."}
+    answer_parts = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        json_str = line[5:].strip()
+        if not json_str:
+            continue
+        try:
+            event = json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+
+        # Strands stream events carry text in "data" key with type "text"
+        # Also handle plain {"text": "..."} or {"answer": "..."} for non-streaming fallback
+        text = ""
+        if isinstance(event, dict):
+            if event.get("type") == "text" and "data" in event:
+                text = event["data"]
+            elif event.get("type") == "tool_use":
+                # Tool call event — show as progress
+                tool_name = event.get("name", event.get("data", ""))
+                if tool_name and on_chunk:
+                    on_chunk(f"🔧 Using tool: {tool_name}\n")
+                continue
+            elif event.get("type") == "tool_result":
+                continue  # skip tool results
+            elif "text" in event:
+                text = event["text"]
+            elif "answer" in event:
+                text = event["answer"]
+            elif "result" in event:
+                text = event["result"]
+
+        if text:
+            answer_parts.append(text)
+            if on_chunk:
+                on_chunk(text)
+
+    # If no SSE events were parsed, treat the whole response as plain text/JSON
+    if not answer_parts:
+        try:
+            data = json.loads(raw)
+            fallback = data.get("answer", data.get("result", data.get("text", raw)))
+        except json.JSONDecodeError:
+            fallback = raw
+        if on_chunk:
+            on_chunk(fallback)
+        return fallback
+
+    return "".join(answer_parts)
 
 
 # ── Local fallback (direct Bedrock tool-use) ───────────────────────────────────
@@ -325,13 +377,9 @@ def ask_notes_agent(
 
             if RETRIEVAL_AGENT_ARN:
                 if on_chunk:
-                    on_chunk("🔍 Querying retrieval agent...")
+                    on_chunk("🔍 Querying retrieval agent...\n")
                 payload = {"prompt": question, "file_index": file_index}
-                if on_chunk:
-                    on_chunk(f"📂 Sending {len(file_index)} files to agent...")
-                answer = _invoke_agentcore(RETRIEVAL_AGENT_ARN, payload)
-                if on_chunk:
-                    on_chunk(answer)
+                answer = _invoke_agentcore(RETRIEVAL_AGENT_ARN, payload, on_chunk=on_chunk)
                 # Keep history consistent for multi-turn
                 conversation_history.append({"role": "user", "content": question})
                 conversation_history.append({"role": "assistant", "content": answer})
@@ -372,11 +420,9 @@ def ask_research_agent(
         try:
             if RESEARCH_AGENT_ARN:
                 if on_chunk:
-                    on_chunk("🌐 Querying research agent...\n\n")
+                    on_chunk("🌐 Querying research agent...\n")
                 payload = {"prompt": question, "customer": customer}
-                answer = _invoke_agentcore(RESEARCH_AGENT_ARN, payload)
-                if on_chunk:
-                    on_chunk(answer)
+                answer = _invoke_agentcore(RESEARCH_AGENT_ARN, payload, on_chunk=on_chunk)
                 conversation_history.append({"role": "user", "content": question})
                 conversation_history.append({"role": "assistant", "content": answer})
             else:

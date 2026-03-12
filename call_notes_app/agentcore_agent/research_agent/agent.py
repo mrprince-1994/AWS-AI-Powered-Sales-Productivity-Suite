@@ -1,7 +1,8 @@
-"""AgentCore Runtime — Customer Research Agent.
+"""AgentCore Runtime — Customer Research Agent (streaming).
 
 Built with Strands. Uses DuckDuckGo web search to research customers,
 find news, funding rounds, tech stack, and competitive context.
+Streams results back via SSE.
 
 Payload schema:
   {
@@ -127,12 +128,13 @@ def web_search(query: str, max_results: int = 5) -> str:
 
 
 @app.entrypoint
-def research_customer(payload, context):
+async def research_customer(payload, context):
     question = payload.get("prompt", "")
     customer_hint = payload.get("customer", "")
 
     if not question:
-        return {"answer": "No research question provided.", "status": "error"}
+        yield {"text": "No research question provided.", "type": "error"}
+        return
 
     # Prepend customer context if provided
     full_prompt = question
@@ -144,22 +146,15 @@ def research_customer(payload, context):
             system_prompt=SYSTEM_PROMPT,
             tools=[web_search],
             model=SONNET_MODEL_ID,
+            callback_handler=None,
         )
 
-        result = agent(full_prompt)
-
-        answer = ""
-        if hasattr(result, "message") and isinstance(result.message, dict):
-            for block in result.message.get("content", []):
-                if isinstance(block, dict) and "text" in block:
-                    answer += block["text"]
-        else:
-            answer = str(result)
-
-        return {"answer": answer, "status": "success"}
+        stream = agent.stream_async(full_prompt)
+        async for event in stream:
+            yield event
 
     except Exception as e:
-        return {"answer": f"Error: {e}", "status": "error"}
+        yield {"text": f"Error: {e}", "type": "error"}
 
 
 if __name__ == "__main__":
