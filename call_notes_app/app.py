@@ -10,6 +10,7 @@ from question_detector import is_aws_aiml_question, extract_question
 from agent_client import ask_agent, warmup as warmup_agent, shutdown as shutdown_agent
 from md_render import configure_tags, MarkdownStreamer
 from notes_retriever import scan_notes, ask_notes_agent, ask_research_agent, NOTE_SOURCES, dedupe_customers
+from chat_history import save_chat_session, list_chat_sessions, load_chat_session, delete_chat_session, _ensure_table
 
 # --- Color Palette ---
 BG_DARK = "#0f0f1a"
@@ -633,8 +634,11 @@ class NotesRetrieverTab:
         self._md_streamer = None
         self._is_responding = False
         self._agent_mode = "retrieval"   # "retrieval" | "research"
+        self._current_session_ts = None  # timestamp key of the active saved session
+        self._session_items = []         # cached list from DynamoDB
         self._build_ui(parent)
         threading.Thread(target=self._refresh_index, daemon=True).start()
+        threading.Thread(target=self._init_history_table, daemon=True).start()
 
     def _build_ui(self, parent):
         # Top bar
@@ -838,6 +842,265 @@ class NotesRetrieverTab:
             command=self._send)
         self.send_btn.grid(row=0, column=1, padx=(0, 10), pady=8)
 
+    def _build_ui(self, parent):
+        # ── Top bar (spans full width) ──────────────────────────────────────
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.pack(fill=tk.X, padx=16, pady=(14, 6))
+
+        ctk.CTkLabel(top, text="📂  Historical Notes Retrieval",
+                     font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                     text_color=FG_BRIGHT).pack(side=tk.LEFT)
+
+        ctk.CTkButton(
+            top, text="＋ New Chat", width=110, height=30,
+            fg_color=GREEN, hover_color=GREEN_HOVER, text_color=BG_DARK,
+            border_width=0, corner_radius=6,
+            font=ctk.CTkFont("Segoe UI", 11, "bold"),
+            command=self._new_chat).pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.refresh_btn = ctk.CTkButton(
+            top, text="⟳ Refresh Index", width=130, height=30,
+            fg_color=BG_INPUT, hover_color=BG_CARD, text_color=ACCENT,
+            border_width=1, border_color=BORDER, corner_radius=6,
+            font=ctk.CTkFont("Segoe UI", 11),
+            command=lambda: threading.Thread(target=self._refresh_index, daemon=True).start())
+        self.refresh_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # Agent mode toggle
+        toggle_frame = ctk.CTkFrame(top, fg_color=BG_CARD, corner_radius=8,
+                                     border_width=1, border_color=BORDER)
+        toggle_frame.pack(side=tk.RIGHT, padx=(0, 12))
+        self._retrieval_btn = ctk.CTkButton(
+            toggle_frame, text="📋 Notes Retrieval", width=140, height=28,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=BG_DARK,
+            corner_radius=6, border_width=0,
+            font=ctk.CTkFont("Segoe UI", 11, "bold"),
+            command=lambda: self._set_agent_mode("retrieval"))
+        self._retrieval_btn.pack(side=tk.LEFT, padx=3, pady=3)
+        self._research_btn = ctk.CTkButton(
+            toggle_frame, text="🌐 Customer Research", width=150, height=28,
+            fg_color="transparent", hover_color=BG_INPUT, text_color=FG_DIM,
+            corner_radius=6, border_width=0,
+            font=ctk.CTkFont("Segoe UI", 11),
+            command=lambda: self._set_agent_mode("research"))
+        self._research_btn.pack(side=tk.LEFT, padx=(0, 3), pady=3)
+
+        # Clickable index summary
+        self.index_label = ctk.CTkLabel(
+            top, text="Scanning...", text_color=ACCENT,
+            font=ctk.CTkFont("Segoe UI", 11), cursor="hand2")
+        self.index_label.pack(side=tk.RIGHT, padx=(0, 12))
+        self.index_label.bind("<Button-1>", lambda e: self._toggle_index_panel())
+
+        # Collapsible index panel (hidden by default)
+        self._index_panel_visible = False
+        self._index_panel = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=8,
+                                          border_width=1, border_color=BORDER)
+        index_header = ctk.CTkFrame(self._index_panel, fg_color="transparent")
+        index_header.pack(fill=tk.X, padx=10, pady=(8, 4))
+        ctk.CTkLabel(index_header, text="Indexed Notes",
+                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=ACCENT).pack(side=tk.LEFT)
+        ctk.CTkButton(index_header, text="✕", width=28, height=24,
+                      fg_color="transparent", hover_color=BG_INPUT,
+                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11),
+                      command=self._toggle_index_panel).pack(side=tk.RIGHT)
+        list_frame = ctk.CTkFrame(self._index_panel, fg_color=BG_INPUT, corner_radius=6)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.notes_list = tk.Listbox(
+            list_frame, bg=BG_INPUT, fg=FG_TEXT,
+            selectbackground=ACCENT, selectforeground=BG_DARK,
+            font=("Segoe UI", 9), borderwidth=0, highlightthickness=0,
+            activestyle="none", height=12)
+        sb_idx = tk.Scrollbar(list_frame, command=self.notes_list.yview,
+                               bg=BG_INPUT, troughcolor=BG_INPUT, bd=0)
+        self.notes_list.configure(yscrollcommand=sb_idx.set)
+        self.notes_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        sb_idx.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._top_bar = top  # anchor for index panel insertion
+
+        # ── Horizontal split: history sidebar + main content ───────────────
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        body.columnconfigure(0, weight=0)   # sidebar — fixed width
+        body.columnconfigure(1, weight=1)   # main content
+        body.rowconfigure(0, weight=1)
+
+        # ── Left: Session History sidebar ──────────────────────────────────
+        sidebar = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=10,
+                                border_width=1, border_color=BORDER, width=220)
+        sidebar.grid(row=0, column=0, sticky="nsew", padx=(16, 6), pady=(0, 8))
+        sidebar.grid_propagate(False)
+
+        sh_header = ctk.CTkFrame(sidebar, fg_color="transparent")
+        sh_header.pack(fill=tk.X, padx=10, pady=(10, 4))
+        ctk.CTkLabel(sh_header, text="🕘 History",
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color=ACCENT).pack(side=tk.LEFT)
+        ctk.CTkButton(sh_header, text="⟳", width=28, height=24,
+                      fg_color="transparent", hover_color=BG_INPUT,
+                      text_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
+                      command=lambda: threading.Thread(
+                          target=self._load_session_history, daemon=True).start()
+                      ).pack(side=tk.RIGHT)
+
+        # Filter: All / Retrieval / Research
+        sh_filter_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
+        sh_filter_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self._sh_filter_var = tk.StringVar(value="All")
+        for label, val in [("All", "All"), ("📋", "retrieval"), ("🌐", "research")]:
+            ctk.CTkButton(
+                sh_filter_frame, text=label, width=56, height=24,
+                fg_color=BG_INPUT, hover_color=BG_CARD, text_color=FG_DIM,
+                corner_radius=6, border_width=1, border_color=BORDER,
+                font=ctk.CTkFont("Segoe UI", 10),
+                command=lambda v=val: self._sh_set_filter(v)
+            ).pack(side=tk.LEFT, padx=(0, 4))
+
+        sh_list_frame = ctk.CTkFrame(sidebar, fg_color=BG_INPUT, corner_radius=6)
+        sh_list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+        self._sh_listbox = tk.Listbox(
+            sh_list_frame, bg=BG_INPUT, fg=FG_TEXT,
+            selectbackground=ACCENT, selectforeground=BG_DARK,
+            font=("Segoe UI", 9), borderwidth=0, highlightthickness=0,
+            activestyle="none")
+        sh_sb = tk.Scrollbar(sh_list_frame, command=self._sh_listbox.yview,
+                              bg=BG_INPUT, troughcolor=BG_INPUT, bd=0)
+        self._sh_listbox.configure(yscrollcommand=sh_sb.set)
+        self._sh_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        sh_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._sh_listbox.bind("<<ListboxSelect>>", self._on_session_select)
+
+        sh_btn_row = ctk.CTkFrame(sidebar, fg_color="transparent")
+        sh_btn_row.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ctk.CTkButton(sh_btn_row, text="🗑 Delete", width=90, height=26,
+                      fg_color=BG_INPUT, hover_color=RED, text_color=FG_DIM,
+                      border_width=1, border_color=BORDER, corner_radius=6,
+                      font=ctk.CTkFont("Segoe UI", 10),
+                      command=self._delete_selected_session).pack(side=tk.LEFT)
+
+        # ── Right: main content ────────────────────────────────────────────
+        main = ctk.CTkFrame(body, fg_color="transparent")
+        main.grid(row=0, column=1, sticky="nsew", padx=(0, 16), pady=0)
+        main.rowconfigure(3, weight=1)
+        main.columnconfigure(0, weight=1)
+
+        # Directory info bar
+        dir_bar = ctk.CTkFrame(main, fg_color=BG_CARD, corner_radius=6)
+        dir_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        for _, label in NOTE_SOURCES:
+            ctk.CTkLabel(dir_bar, text=f"📁  {label}",
+                         text_color=FG_DIM, font=ctk.CTkFont("Consolas", 10),
+                         anchor="w").pack(fill=tk.X, padx=10, pady=(4, 0))
+        ctk.CTkFrame(dir_bar, fg_color="transparent", height=4).pack()
+
+        # Source + customer filter row
+        filter_row = ctk.CTkFrame(main, fg_color="transparent")
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ctk.CTkLabel(filter_row, text="Source:",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
+        self.source_filter_var = tk.StringVar(value="All Sources")
+        source_options = ["All Sources"] + [label for _, label in NOTE_SOURCES]
+        self.source_combo = ctk.CTkComboBox(
+            filter_row, variable=self.source_filter_var, width=140,
+            fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
+            button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
+            dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
+            values=source_options,
+            command=lambda _: self._new_chat())
+        self.source_combo.pack(side=tk.LEFT, padx=(8, 16))
+        ctk.CTkLabel(filter_row, text="Customer:",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
+        self.customer_filter_var = tk.StringVar(value="(All)")
+        self.customer_combo = ctk.CTkComboBox(
+            filter_row, variable=self.customer_filter_var, width=200,
+            fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
+            button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
+            dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
+            values=["(All)"],
+            command=lambda _: self._new_chat())
+        self.customer_combo.pack(side=tk.LEFT, padx=(8, 0))
+        ctk.CTkLabel(filter_row,
+                     text="  (changing filters starts a new chat)",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
+
+        # Suggested prompts
+        prompts_frame = ctk.CTkFrame(main, fg_color="transparent")
+        prompts_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        ctk.CTkLabel(prompts_frame, text="Suggestions:",
+                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
+        for prompt in [
+            "What action items are outstanding?",
+            "Summarize all calls with this customer",
+            "What pricing was discussed?",
+            "What follow-ups were promised?",
+        ]:
+            ctk.CTkButton(
+                prompts_frame, text=prompt, height=24,
+                fg_color=BG_CARD, hover_color=BG_INPUT, text_color=FG_DIM,
+                border_width=1, border_color=BORDER, corner_radius=12,
+                font=ctk.CTkFont("Segoe UI", 10),
+                command=lambda p=prompt: self._use_suggestion(p)
+            ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Chat panel
+        chat_outer = ctk.CTkFrame(main, fg_color=BG_PANEL, corner_radius=10,
+                                   border_width=1, border_color=BORDER)
+        chat_outer.grid(row=3, column=0, sticky="nsew", pady=(0, 0))
+        chat_outer.rowconfigure(0, weight=1)
+        chat_outer.rowconfigure(1, weight=0)
+        chat_outer.columnconfigure(0, weight=1)
+
+        chat_header = ctk.CTkFrame(chat_outer, fg_color="transparent")
+        chat_header.grid(row=0, column=0, sticky="new", padx=12, pady=(10, 4))
+        ctk.CTkLabel(chat_header, text="Chat",
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color=YELLOW).pack(side=tk.LEFT)
+        self.turn_label = ctk.CTkLabel(
+            chat_header, text="New conversation",
+            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
+        self.turn_label.pack(side=tk.LEFT, padx=(10, 0))
+        self.model_label = ctk.CTkLabel(
+            chat_header, text="📋 Notes Retrieval  ·  Claude Opus 4.6  ·  Bedrock",
+            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
+        self.model_label.pack(side=tk.RIGHT)
+
+        self.chat_text = StyledText(chat_outer, font=("Segoe UI", 10))
+        self.chat_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=(32, 4))
+        configure_tags(self.chat_text)
+        self.chat_text.tag_configure(
+            "user_msg", foreground=ACCENT,
+            font=("Segoe UI Semibold", 10), lmargin1=8, lmargin2=8, spacing1=6)
+        self.chat_text.tag_configure(
+            "user_label", foreground=ACCENT,
+            font=("Segoe UI", 9), spacing1=8)
+        self.chat_text.tag_configure(
+            "assistant_label", foreground=YELLOW,
+            font=("Segoe UI", 9), spacing1=8)
+
+        input_row = ctk.CTkFrame(chat_outer, fg_color=BG_CARD, corner_radius=0)
+        input_row.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
+        input_row.columnconfigure(0, weight=1)
+
+        self.input_var = tk.StringVar()
+        self.input_entry = ctk.CTkEntry(
+            input_row, textvariable=self.input_var,
+            fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 12), corner_radius=6,
+            placeholder_text="Ask a follow-up or start a new question...")
+        self.input_entry.grid(row=0, column=0, sticky="ew", padx=(10, 6), pady=8)
+        self.input_entry.bind("<Return>", lambda e: self._send())
+
+        self.send_btn = ctk.CTkButton(
+            input_row, text="Send ↵", width=90, height=36,
+            fg_color=YELLOW, hover_color=YELLOW_HOVER, text_color=BG_DARK,
+            font=ctk.CTkFont("Segoe UI", 12, "bold"), corner_radius=6,
+            command=self._send)
+        self.send_btn.grid(row=0, column=1, padx=(0, 10), pady=8)
+
     # ── Actions ──
 
     def _set_agent_mode(self, mode: str):
@@ -876,6 +1139,7 @@ class NotesRetrieverTab:
     def _new_chat(self):
         """Reset conversation history and clear the chat display."""
         self._conversation_history = []
+        self._current_session_ts = None
         self._is_responding = False
         self.chat_text.config(state=tk.NORMAL)
         self.chat_text.delete("1.0", tk.END)
@@ -883,6 +1147,139 @@ class NotesRetrieverTab:
         self.send_btn.configure(state=tk.NORMAL, text="Send ↵")
         self.turn_label.configure(text="New conversation")
         self.input_entry.focus()
+
+    # ── Session history ──
+
+    def _init_history_table(self):
+        """Create DynamoDB table on first run (no-op if it already exists)."""
+        try:
+            _ensure_table()
+            self._sh_listbox.after(0, lambda: threading.Thread(
+                target=self._load_session_history, daemon=True).start())
+        except Exception:
+            pass
+
+    def _sh_set_filter(self, val: str):
+        self._sh_filter_var.set(val)
+        threading.Thread(target=self._load_session_history, daemon=True).start()
+
+    def _load_session_history(self):
+        try:
+            fval = self._sh_filter_var.get()
+            stype = None if fval == "All" else fval
+            items = list_chat_sessions(session_type=stype, limit=60)
+            self._session_items = items
+            self._sh_listbox.after(0, self._update_session_list_ui)
+        except Exception:
+            pass
+
+    def _update_session_list_ui(self):
+        self._sh_listbox.delete(0, tk.END)
+        for item in self._session_items:
+            icon = "📋" if item.get("session_type") == "retrieval" else "🌐"
+            ts = item.get("timestamp", "")[:16].replace("T", " ")
+            title = item.get("title", "—")[:28]
+            turns = item.get("turn_count", 0)
+            self._sh_listbox.insert(tk.END, f"{icon} {ts}\n{title}  ({turns}t)")
+
+    def _on_session_select(self, event):
+        sel = self._sh_listbox.curselection()
+        if not sel:
+            return
+        item = self._session_items[sel[0]]
+        threading.Thread(target=self._restore_session,
+                         args=(item["session_type"], item["timestamp"]),
+                         daemon=True).start()
+
+    def _restore_session(self, session_type: str, timestamp: str):
+        try:
+            item = load_chat_session(session_type, timestamp)
+            if not item:
+                return
+            history = item.get("conversation_history", [])
+            self._sh_listbox.after(0, lambda: self._apply_restored_session(item, history))
+        except Exception:
+            pass
+
+    def _apply_restored_session(self, item: dict, history: list):
+        """Render a restored session into the chat display (read-only replay)."""
+        # Switch to the correct agent mode
+        stype = item.get("session_type", "retrieval")
+        if stype != self._agent_mode:
+            self._set_agent_mode(stype)
+
+        self._conversation_history = list(history)
+        self._current_session_ts = item.get("timestamp")
+        self._is_responding = False
+
+        self.chat_text.config(state=tk.NORMAL)
+        self.chat_text.delete("1.0", tk.END)
+
+        # Replay turns from history
+        for msg in history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Tool-use blocks — extract text parts only
+                content = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if not content:
+                continue
+            if role == "user":
+                self.chat_text.insert(tk.END, "You\n", "user_label")
+                self.chat_text.insert(tk.END, f"{content}\n\n", "user_msg")
+            elif role == "assistant":
+                self.chat_text.insert(tk.END, "Assistant\n", "assistant_label")
+                self.chat_text.insert(tk.END, f"{content}\n\n", "body")
+
+        self.chat_text.see(tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+
+        turns = len(history) // 2
+        ts_display = item.get("timestamp", "")[:16].replace("T", " ")
+        self.turn_label.configure(
+            text=f"{turns} turn{'s' if turns != 1 else ''}  ·  restored {ts_display}")
+        self.send_btn.configure(state=tk.NORMAL, text="Send ↵")
+
+    def _save_current_session(self):
+        """Persist the current conversation to DynamoDB."""
+        if not self._conversation_history:
+            return
+        # Derive a title from the first user message
+        first_user = next(
+            (m["content"] for m in self._conversation_history
+             if m["role"] == "user" and isinstance(m["content"], str)),
+            "Chat session"
+        )
+        title = first_user[:80]
+        customer = self.customer_filter_var.get()
+        source = self.source_filter_var.get()
+        try:
+            ts = save_chat_session(
+                session_type=self._agent_mode,
+                title=title,
+                conversation_history=self._conversation_history,
+                customer=customer if customer != "(All)" else "",
+                source_filter=source if source != "All Sources" else "",
+            )
+            self._current_session_ts = ts
+            # Refresh sidebar in background
+            threading.Thread(target=self._load_session_history, daemon=True).start()
+        except Exception:
+            pass
+
+    def _delete_selected_session(self):
+        sel = self._sh_listbox.curselection()
+        if not sel:
+            return
+        item = self._session_items[sel[0]]
+        try:
+            delete_chat_session(item["session_type"], item["timestamp"])
+            threading.Thread(target=self._load_session_history, daemon=True).start()
+        except Exception:
+            pass
 
     def _refresh_index(self):
         all_notes = scan_notes()
@@ -1034,6 +1431,10 @@ class NotesRetrieverTab:
         self._is_responding = False
         self.send_btn.configure(state=tk.NORMAL, text="Send ↵")
         self.input_entry.focus()
+
+        # Auto-save session after each completed turn
+        if not error:
+            threading.Thread(target=self._save_current_session, daemon=True).start()
 
 
 def main():
