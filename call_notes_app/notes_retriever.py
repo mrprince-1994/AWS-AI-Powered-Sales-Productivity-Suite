@@ -407,9 +407,14 @@ def _local_retrieval(question: str, file_index: list[dict], conversation_history
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 64000,
             "system": (
-                "You are a retrieval assistant for historical call notes. "
-                "Use read_note_file to fetch files, then answer the question. "
-                "Cite customer, source, and filename in your answer."
+                "You are an expert assistant that retrieves and synthesizes information "
+                "from historical customer call notes for an AWS account manager. "
+                "Use read_note_file to fetch files, then produce a comprehensive answer. "
+                "When asked for recent context on a customer, read ALL their notes and provide: "
+                "a customer overview, recent discussions (most recent first with key details), "
+                "outstanding action items with owners, recurring themes, and current status. "
+                "Always cite customer, source, filename, and date. Be thorough — read all "
+                "relevant files. If asked a specific question, answer it directly."
             ),
             "messages": conversation_history,
             "tools": [READ_TOOL],
