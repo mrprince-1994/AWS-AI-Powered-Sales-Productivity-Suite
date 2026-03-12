@@ -47,28 +47,127 @@ def _date_from_sa_filename(fname: str) -> str:
 
 def _normalize_customer(name: str) -> str:
     s = name.lower()
+    # Strip common domain suffixes
+    s = re.sub(r"\.(com|io|ai|co|org|net)$", "", s)
+    # Replace & with 'and', underscores with spaces
+    s = s.replace("&", "and").replace("_", " ")
+    # Remove all non-alphanumeric except spaces
     s = re.sub(r"[^\w\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
+    # Strip trailing plurals
     s = re.sub(r"es$", "", s)
     s = re.sub(r"s$", "", s)
     return s
 
 
+# Words that indicate a filename/topic leaked through as a customer name
+_NOISE_WORDS = {
+    "discussion", "call", "discovery", "alignment", "poc", "demo", "meeting",
+    "review", "sync", "followup", "follow-up", "notes", "pipeline", "bedrock",
+    "sagemaker", "claude", "ai", "ml", "p4", "p5", "ack", "bi", "s3",
+    "vectors", "with", "rapid",
+}
+
+
+def _is_likely_customer(name: str) -> bool:
+    """Filter out names that are clearly not customer names."""
+    s = name.strip()
+    if not s or len(s) < 2:
+        return False
+    # Pure numbers (e.g. "2025")
+    if re.match(r"^\d+$", s):
+        return False
+    # Very long names are usually filenames/topics, not customers
+    if len(s) > 40:
+        return False
+    # Contains multiple underscores — likely a filename stem
+    if s.count("_") >= 2:
+        return False
+    # If more than half the words are noise, it's probably not a customer
+    words = re.split(r"[\s_]+", s.lower())
+    if len(words) > 2:
+        noise_count = sum(1 for w in words if w in _NOISE_WORDS)
+        if noise_count >= len(words) / 2:
+            return False
+    return True
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Simple Levenshtein distance for short strings."""
+    if len(a) < len(b):
+        return _edit_distance(b, a)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
 def dedupe_customers(names: list[str]) -> dict[str, str]:
-    """Return {original_name: canonical_name} merging near-duplicates."""
+    """Return {original_name: canonical_name} merging near-duplicates.
+
+    Strategy:
+    1. Normalize names (lowercase, strip punctuation/domains/plurals)
+    2. Group exact normalized matches
+    3. Merge groups where one normalized form is a prefix of another
+       (e.g. "bqe" matches "bqe eba", "boku" matches "boku discovery call")
+    4. Pick the shortest original name as canonical
+    5. Filter out non-customer names (years, meeting topics, etc.)
+    """
+    # Filter out obvious non-customers first
+    filtered = [n for n in names if _is_likely_customer(n)]
+
     groups: dict[str, list[str]] = {}
-    for name in names:
+    for name in filtered:
         groups.setdefault(_normalize_customer(name), []).append(name)
 
     keys = sorted(groups.keys())
     merged: dict[str, str] = {}
+
     for i, k in enumerate(keys):
         if k in merged:
             continue
+        # Split into words for smarter matching
+        k_words = k.split()
+        k_first = k_words[0] if k_words else k
+
         for k2 in keys[i + 1:]:
             if k2 in merged:
                 continue
-            if k2.startswith(k) and len(k2) - len(k) <= 3:
+            k2_words = k2.split()
+            k2_first = k2_words[0] if k2_words else k2
+
+            # Merge if:
+            # 1. One is a prefix of the other (any length diff)
+            # 2. First word matches and the shorter name is ≤2 words
+            #    (catches "BQE" → "BQE EBA", "Boku" → "Boku Discovery Call")
+            # 3. Names differ only by spaces/no-spaces
+            #    (catches "ClearCaptions" vs "Clear Captions", "Cast and Crew" vs "CastAndCrew")
+            should_merge = False
+
+            if k2.startswith(k) and len(k_words) <= 2:
+                should_merge = True
+            elif k_first == k2_first and len(k_words) == 1:
+                should_merge = True
+            elif k.replace(" ", "") == k2.replace(" ", ""):
+                should_merge = True
+            # Catch typos: single-word names differing by ≤2 edits
+            elif (len(k_words) == 1 and len(k2_words) == 1
+                  and abs(len(k) - len(k2)) <= 2
+                  and len(k) >= 4
+                  and _edit_distance(k, k2) <= 2):
+                should_merge = True
+            # Catch typos in multi-word names: same word count, total edit distance ≤2
+            elif (len(k_words) == len(k2_words) and len(k_words) >= 2
+                  and k_first == k2_first
+                  and _edit_distance(k, k2) <= 2):
+                should_merge = True
+
+            if should_merge:
                 merged[k2] = k
                 groups[k].extend(groups.pop(k2, []))
 
@@ -77,6 +176,12 @@ def dedupe_customers(names: list[str]) -> dict[str, str]:
         canonical = min(orig_names, key=lambda n: (len(n), n.lower()))
         for orig in orig_names:
             canonical_map[orig] = canonical
+
+    # Also map filtered-out names to themselves so _get_active_notes still works
+    for name in names:
+        if name not in canonical_map:
+            canonical_map[name] = name
+
     return canonical_map
 
 
@@ -300,7 +405,7 @@ def _local_retrieval(question: str, file_index: list[dict], conversation_history
     for _ in range(10):
         payload = {
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 8192,
+            "max_tokens": 64000,
             "system": (
                 "You are a retrieval assistant for historical call notes. "
                 "Use read_note_file to fetch files, then answer the question. "
@@ -562,7 +667,7 @@ def ask_research_agent(
             for _ in range(6):  # max tool-use loops
                 payload = {
                     "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 8192,
+                    "max_tokens": 64000,
                     "system": RESEARCH_SYSTEM_PROMPT.format(
                         today=datetime.now().strftime("%B %d, %Y"),
                         year=datetime.now().strftime("%Y"),

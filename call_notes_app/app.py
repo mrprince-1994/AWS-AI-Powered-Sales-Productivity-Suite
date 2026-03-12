@@ -1110,15 +1110,17 @@ class NotesRetrieverTab:
         raw_names = list({n["customer"] for n in all_notes})
 
         # Fuzzy-deduplicate: 'Common Chain' and 'Common Chains' → one entry
-        from notes_retriever import dedupe_customers
+        from notes_retriever import dedupe_customers, _is_likely_customer
         canonical_map = dedupe_customers(raw_names)
 
         # Store the mapping so _get_active_notes can match against canonical names
         self._canonical_map = canonical_map
 
-        # Unique canonical names for the dropdown
+        # Unique canonical names for the dropdown — only real customer names
         canonical_set = {}
         for orig, canon in canonical_map.items():
+            if not _is_likely_customer(canon):
+                continue
             key = canon.lower()
             if key not in canonical_set:
                 canonical_set[key] = canon
