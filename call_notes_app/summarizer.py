@@ -14,13 +14,32 @@ Structure the notes as follows:
 Who was on the call, the purpose, and any relevant background mentioned.
 
 ## Detailed Discussion Notes
-A thorough, chronological account of what was discussed. Organize by topic with sub-bullets
-for details. Include:
-- Specific points raised by participants
-- Questions asked and answers given
-- Technical details, numbers, dates, or specifics mentioned
-- Concerns or objections raised
-- Examples or scenarios discussed
+This is the most important section. Write a thorough, chronological account organized
+by topic. For EACH topic discussed:
+
+1. Use a numbered heading for each major topic (e.g. "1. GitHub Repository Access")
+2. Under each topic, write FULL PARAGRAPHS — not just terse bullets. Explain:
+   - What was said and WHO said it (attribute statements to speakers)
+   - The CONTEXT and REASONING behind statements — why something was brought up,
+     what problem it solves, what the background is
+   - The back-and-forth of the conversation — if someone asked a question and
+     another person responded, capture both sides with the nuance
+   - Specific examples, demos, or walkthroughs that were shown
+   - Technical details: system names, workflows, architectures, data flows,
+     numbers, metrics, timelines, versions, URLs, file names
+   - Concerns, caveats, or edge cases that were raised
+   - How the discussion evolved — if the group changed direction or refined
+     their understanding, capture that progression
+
+3. Use sub-bullets only for lists of discrete items (e.g. a list of features,
+   a set of requirements). For narrative discussion, use full sentences and paragraphs.
+
+4. Include direct quotes for important commitments, opinions, or colorful phrasing
+   (e.g. James said: "This is really a chain of title workflow, not just Q&A")
+
+5. Do NOT over-compress. If someone spent 3 minutes explaining how a workflow operates,
+   that should be a full paragraph in the notes, not a single bullet point.
+   A 30-minute call should produce at least 2-3 pages of detailed discussion notes.
 
 ## Decisions & Agreements
 Every decision made or agreement reached, with the reasoning behind it if discussed.
