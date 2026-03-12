@@ -11,6 +11,7 @@ Payload schema:
 """
 import os
 import json
+import re
 import urllib.request
 import urllib.parse
 
@@ -52,6 +53,43 @@ Always cite your sources with URLs. If search returns limited results, say so cl
 app = BedrockAgentCoreApp()
 
 
+def _clean_html(s: str) -> str:
+    """Strip HTML tags and decode common entities."""
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&nbsp;", " ")
+    return s.strip()
+
+
+def _ddg_html_search(query: str, max_results: int = 5) -> list[dict]:
+    """Fallback: scrape DuckDuckGo HTML results."""
+    encoded = urllib.parse.quote_plus(query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    results = []
+    blocks = re.findall(r"result__body.*?(?=result__body|$)", html, re.DOTALL)
+    for block in blocks[:max_results]:
+        title_m = re.search(r'result__a[^>]*>(.*?)</a>', block, re.DOTALL)
+        url_m   = re.search(r'result__url[^>]*>\s*(.*?)\s*</span>', block, re.DOTALL)
+        snip_m  = re.search(r'result__snippet[^>]*>(.*?)</span>', block, re.DOTALL)
+        title = _clean_html(title_m.group(1)) if title_m else ""
+        link  = _clean_html(url_m.group(1))   if url_m   else ""
+        snip  = _clean_html(snip_m.group(1))  if snip_m  else ""
+        if title or snip:
+            results.append({"title": title, "href": link, "body": snip})
+    return results
+
+
 @tool
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web using DuckDuckGo for current information about a company or topic.
@@ -60,46 +98,32 @@ def web_search(query: str, max_results: int = 5) -> str:
         query: Search query string
         max_results: Maximum number of results to return (default 5)
     """
+    results = []
+
+    # Primary: duckduckgo-search package
     try:
-        encoded = urllib.parse.quote_plus(query)
-        url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            hits = list(ddgs.text(query, max_results=max_results))
+        results = hits
+    except Exception as e1:
+        # Fallback: HTML scraper
+        try:
+            results = _ddg_html_search(query, max_results)
+        except Exception as e2:
+            return f"Search error for '{query}': primary={e1}, fallback={e2}"
 
-        results = []
+    if not results:
+        return f"No results found for: {query}"
 
-        # Abstract (main result)
-        if data.get("AbstractText"):
-            results.append(
-                f"**{data.get('Heading', 'Overview')}**\n"
-                f"{data['AbstractText']}\n"
-                f"Source: {data.get('AbstractURL', '')}"
-            )
+    parts = []
+    for r in results:
+        title = r.get("title", "")
+        link  = r.get("href", r.get("url", ""))
+        body  = r.get("body", r.get("snippet", ""))
+        parts.append(f"**{title}**\n{link}\n{body}")
 
-        # Related topics
-        for topic in data.get("RelatedTopics", [])[:max_results]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                results.append(
-                    f"- {topic['Text']}\n  {topic.get('FirstURL', '')}"
-                )
-
-        if not results:
-            # Fallback: try news search via DuckDuckGo HTML (lite)
-            news_url = f"https://api.duckduckgo.com/?q={encoded}&format=json&ia=news"
-            req2 = urllib.request.Request(news_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req2, timeout=10) as resp2:
-                data2 = json.loads(resp2.read().decode())
-            for item in data2.get("Results", [])[:max_results]:
-                results.append(f"- {item.get('Text', '')}\n  {item.get('FirstURL', '')}")
-
-        if not results:
-            return f"No results found for: {query}"
-
-        return f"Search results for '{query}':\n\n" + "\n\n".join(results)
-
-    except Exception as e:
-        return f"Search error for '{query}': {e}"
+    return f"Search results for '{query}':\n\n" + "\n\n---\n\n".join(parts)
 
 
 @app.entrypoint
