@@ -101,3 +101,62 @@ def generate_notes(transcript: str, customer_name: str, on_chunk=None) -> str:
                     on_chunk(text)
 
     return "".join(full_text)
+
+EMAIL_SYSTEM_PROMPT = """You are a professional follow-up email writer for business meetings.
+Given meeting notes from a call, generate a polished follow-up email that can be sent to the
+attendees. The email should:
+
+1. Start with a warm greeting and thank them for their time
+2. Briefly recap the key topics discussed (2-3 sentences max per topic — this is a summary, not the full notes)
+3. Clearly list any action items with owners and deadlines
+4. Mention agreed-upon next steps and any follow-up meetings
+5. Close professionally with an offer to clarify anything
+
+Keep the tone professional but warm — like a Solutions Architect following up with a customer.
+Use plain text formatting suitable for pasting into Outlook (no markdown headers, use dashes
+for bullets). Keep it concise — ideally under 300 words. Do NOT include a subject line in the
+body — just the email body starting with the greeting.
+
+Also generate a suggested subject line on the very first line in this format:
+Subject: <your suggested subject line>
+
+Then a blank line, then the email body."""
+
+
+def generate_followup_email(notes: str, customer_name: str, on_chunk=None) -> str:
+    """Generate a follow-up email from meeting notes using Claude on Bedrock."""
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=AWS_REGION,
+        config=Config(read_timeout=300),
+    )
+
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "system": EMAIL_SYSTEM_PROMPT,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Customer: {customer_name}\n\nMeeting Notes:\n{notes}",
+            }
+        ],
+    }
+    response = client.invoke_model_with_response_stream(
+        modelId=CLAUDE_MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(payload),
+    )
+
+    full_text = []
+    for event in response["body"]:
+        chunk = json.loads(event["chunk"]["bytes"])
+        if chunk.get("type") == "content_block_delta":
+            text = chunk["delta"].get("text", "")
+            if text:
+                full_text.append(text)
+                if on_chunk:
+                    on_chunk(text)
+
+    return "".join(full_text)

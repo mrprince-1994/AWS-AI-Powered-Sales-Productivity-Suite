@@ -12,7 +12,7 @@ _dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 _table = _dynamodb.Table(TABLE_NAME)
 
 
-def save_session(customer_name: str, transcript: str, notes: str, docx_path: str):
+def save_session(customer_name: str, transcript: str, notes: str, docx_path: str, followup_email: str = ""):
     """Store a completed session in DynamoDB."""
     _table.put_item(Item={
         "customer_name": customer_name,
@@ -20,6 +20,7 @@ def save_session(customer_name: str, transcript: str, notes: str, docx_path: str
         "transcript": transcript,
         "notes": notes,
         "docx_path": docx_path,
+        "followup_email": followup_email,
         "expiry_ttl": int(time.time()) + (TTL_DAYS * 86400),
     })
 

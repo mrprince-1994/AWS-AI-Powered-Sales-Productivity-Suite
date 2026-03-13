@@ -3,7 +3,7 @@ from tkinter import messagebox, filedialog
 import customtkinter as ctk
 import threading
 from transcriber import LiveTranscriber
-from summarizer import generate_notes
+from summarizer import generate_notes, generate_followup_email
 from storage import save_notes, _md_to_docx
 from history import save_session, list_sessions, get_all_customers
 from question_detector import is_aws_aiml_question, extract_question
@@ -72,6 +72,7 @@ class CallNotesApp:
         self.transcriber = None
         self._current_transcript = ""
         self._current_notes = ""
+        self._current_email = ""
         self._ai_enabled = True
         self._pending_questions = set()
         self._build_ui()
@@ -242,7 +243,23 @@ class CallNotesApp:
                      font=ctk.CTkFont("Segoe UI", 12, "bold"),
                      text_color=ACCENT).pack(anchor=tk.W, padx=16, pady=(2, 4))
         self.notes_text = StyledText(card, height=8)
-        self.notes_text.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+        self.notes_text.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 8))
+
+        # Follow-Up Email
+        email_header = ctk.CTkFrame(card, fg_color="transparent")
+        email_header.pack(fill=tk.X, padx=16, pady=(2, 4))
+        ctk.CTkLabel(email_header, text="📧  Follow-Up Email",
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color=ACCENT).pack(side=tk.LEFT)
+        self.copy_email_btn = ctk.CTkButton(
+            email_header, text="📋 Copy to Clipboard", width=140, height=28,
+            fg_color=BG_INPUT, hover_color=BG_CARD, text_color=FG_TEXT,
+            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+            border_width=1, border_color=BORDER, state=tk.DISABLED,
+            command=self._copy_email)
+        self.copy_email_btn.pack(side=tk.RIGHT)
+        self.email_text = StyledText(card, height=6, font=("Segoe UI", 10))
+        self.email_text.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
 
 
     # ── Right: AI Answers ──
@@ -408,9 +425,11 @@ class CallNotesApp:
         item = self._history_items[sel[0]]
         self._current_transcript = item.get("transcript", "")
         self._current_notes = item.get("notes", "")
+        self._current_email = item.get("followup_email", "")
 
         for widget, content in [(self.transcript_text, self._current_transcript),
-                                 (self.notes_text, self._current_notes)]:
+                                 (self.notes_text, self._current_notes),
+                                 (self.email_text, self._current_email)]:
             widget.config(state=tk.NORMAL)
             widget.delete("1.0", tk.END)
             widget.insert(tk.END, content)
@@ -419,9 +438,19 @@ class CallNotesApp:
         self.customer_var.set(item["customer_name"])
         self.export_docx_btn.configure(state=tk.NORMAL)
         self.export_pdf_btn.configure(state=tk.NORMAL)
+        self.copy_email_btn.configure(state=tk.NORMAL if self._current_email else tk.DISABLED)
         self.status_var.set(f"Loaded session from {item['timestamp'][:16]}")
 
     # ─────────────────────────── EXPORT ───────────────────────────
+
+    def _copy_email(self):
+        email = self._current_email.strip()
+        if not email:
+            messagebox.showinfo("Nothing to copy", "No follow-up email generated yet.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(email)
+        self.status_var.set("📋 Email copied to clipboard!")
 
     def _export_docx(self):
         if not self._current_notes:
@@ -545,16 +574,18 @@ class CallNotesApp:
             messagebox.showwarning("No Device", "Please select at least one audio device.")
             return
 
-        for w in (self.transcript_text, self.notes_text):
+        for w in (self.transcript_text, self.notes_text, self.email_text):
             w.config(state=tk.NORMAL)
             w.delete("1.0", tk.END)
             w.config(state=tk.DISABLED)
 
         self._current_transcript = ""
         self._current_notes = ""
+        self._current_email = ""
         self._pending_questions.clear()
         self.export_docx_btn.configure(state=tk.DISABLED)
         self.export_pdf_btn.configure(state=tk.DISABLED)
+        self.copy_email_btn.configure(state=tk.DISABLED)
 
         self.transcriber = LiveTranscriber(
             system_device=system_dev, mic_device=mic_dev,
@@ -601,13 +632,25 @@ class CallNotesApp:
             notes = generate_notes(transcript, customer, on_chunk=on_chunk)
             self._current_notes = notes
             filepath = save_notes(customer, notes)
+
+            # Generate follow-up email from the notes
+            self.root.after(0, lambda: self.status_var.set("Generating follow-up email..."))
+            self.root.after(0, self._prepare_email_for_streaming)
+
+            def on_email_chunk(text):
+                self.root.after(0, self._append_email_chunk, text)
+
+            email = generate_followup_email(notes, customer, on_chunk=on_email_chunk)
+            self._current_email = email
+
             try:
-                save_session(customer, transcript, notes, filepath)
+                save_session(customer, transcript, notes, filepath, followup_email=email)
             except Exception:
                 pass
             self.root.after(0, lambda: self.status_var.set(f"Notes saved: {filepath}"))
             self.root.after(0, lambda: self.export_docx_btn.configure(state=tk.NORMAL))
             self.root.after(0, lambda: self.export_pdf_btn.configure(state=tk.NORMAL))
+            self.root.after(0, lambda: self.copy_email_btn.configure(state=tk.NORMAL))
             self.root.after(0, self._refresh_history)
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror(
@@ -622,6 +665,15 @@ class CallNotesApp:
         self.notes_text.config(state=tk.NORMAL)
         self.notes_text.insert(tk.END, text)
         self.notes_text.see(tk.END)
+
+    def _prepare_email_for_streaming(self):
+        self.email_text.config(state=tk.NORMAL)
+        self.email_text.delete("1.0", tk.END)
+
+    def _append_email_chunk(self, text):
+        self.email_text.config(state=tk.NORMAL)
+        self.email_text.insert(tk.END, text)
+        self.email_text.see(tk.END)
 
 
 class NotesRetrieverTab:

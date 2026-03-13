@@ -1,7 +1,6 @@
 """AgentCore Runtime — Customer Research Agent (streaming).
 
-Built with Strands. Uses DuckDuckGo web search to research customers,
-find news, funding rounds, tech stack, and competitive context.
+Built with Strands. Uses DuckDuckGo web search to research customers.
 Streams results back via SSE.
 
 Payload schema:
@@ -15,6 +14,7 @@ import json
 import re
 import urllib.request
 import urllib.parse
+from datetime import datetime
 
 os.environ["BYPASS_TOOL_CONSENT"] = "true"
 
@@ -23,48 +23,31 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
 SONNET_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 
-SYSTEM_PROMPT = """You are an expert customer research analyst helping an AWS account manager \
-prepare for and follow up on customer calls. Your job is to produce a comprehensive \
-business brief that the account manager can use to have an informed, value-driven conversation.
+SYSTEM_PROMPT = """You are an expert customer research assistant helping an AWS account manager. \
+Today's date is {today}. You have a `web_search` tool — use it to find current, accurate \
+information. Always include the current year ({year}) in your search queries.
 
-You have a `web_search` tool. Use it aggressively — run 4-6 targeted searches to build \
-a thorough picture. Search for the company name, their products, recent news, AI/ML \
-initiatives, competitors, and industry trends.
+Your job is to directly answer the user's question using web search results. \
+Be flexible — adapt your response format to match what was asked:
 
-Structure your research brief with these exact sections:
+- If asked for latest news → search for recent news and present findings \
+chronologically, highlighting any AI/ML relevance
+- If asked for a business overview → provide company description, products, \
+industry, size, key customers, and market position
+- If asked about AI/ML use cases → search specifically for the company's \
+AI/ML initiatives, products, and announcements
+- If asked for talking points → tailor recommendations to the company's \
+situation with specific AWS service mappings
+- If asked a general question → answer it directly using search results
 
-## 1. Business Overview
-- What the company does, their core products/services, and primary focus areas
-- Industry vertical, company size, stage (startup/growth/enterprise), headquarters
-- Key customers, partners, or market segments they serve
-- Recent funding, acquisitions, leadership changes, or strategic pivots
-
-## 2. AI/ML Solutions in Production
-- Search specifically for any AI, ML, generative AI, or automation capabilities \
-the company has shipped or announced
-- Look for press releases, blog posts, or product pages mentioning AI/ML features
-- Note which models, platforms, or cloud providers they use if mentioned
-- If no AI/ML solutions are found, state that clearly — don't fabricate
-
-## 3. AI/ML Use Cases & Industry Success Stories
-- Based on the company's industry vertical, identify 3-5 high-impact AI/ML use cases \
-that similar companies have successfully deployed
-- Reference real AWS customer success stories or case studies in the same vertical \
-(e.g., "Company X in [industry] used Amazon Bedrock for [use case]")
-- Prioritize use cases that align with the company's business model and pain points
-- Include specific AWS services that map to each use case (Bedrock, SageMaker, \
-Textract, Comprehend, Personalize, etc.)
-
-## 4. Recommended Talking Points
-- 4-6 specific, actionable talking points the account manager should raise
-- Frame each as a question or conversation starter tied to a business outcome
-- Connect each talking point to a specific AWS capability or service
-- Include at least one point about generative AI / Amazon Bedrock
-- Tailor to the company's maturity level — don't pitch advanced ML to a company \
-that hasn't started their cloud journey
-
-Always cite your sources with URLs. If search returns limited results for any section, \
-say so clearly and provide your best analysis based on available information."""
+Guidelines:
+- Run 2-3 targeted searches to get comprehensive results
+- Always cite sources with URLs
+- When discussing any topic, note AI/ML relevance if applicable — \
+the user is an AWS account manager focused on AI/ML opportunities
+- Use clean markdown formatting with headers and bullets
+- If search returns limited results, say so and provide your best analysis
+- Do NOT force a rigid template — answer naturally based on the question"""
 
 app = BedrockAgentCoreApp()
 
@@ -76,7 +59,7 @@ def _clean_html(s: str) -> str:
     return s.strip()
 
 
-def _ddg_html_search(query: str, max_results: int = 5) -> list[dict]:
+def _ddg_html_search(query: str, max_results: int = 10) -> list[dict]:
     """Fallback: scrape DuckDuckGo HTML results."""
     encoded = urllib.parse.quote_plus(query)
     url = f"https://html.duckduckgo.com/html/?q={encoded}"
@@ -107,7 +90,7 @@ def _ddg_html_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 @tool
-def web_search(query: str, max_results: int = 5) -> str:
+def web_search(query: str, max_results: int = 10) -> str:
     """Search the web using DuckDuckGo for current information about a company or topic.
 
     Args:
@@ -162,14 +145,18 @@ async def research_customer(payload, context):
         yield {"text": "No research question provided.", "type": "error"}
         return
 
-    # Prepend customer context if provided
     full_prompt = question
     if customer_hint and customer_hint.lower() not in question.lower():
         full_prompt = f"Research customer: {customer_hint}\n\n{question}"
 
     try:
+        now = datetime.now()
+        prompt_with_date = SYSTEM_PROMPT.format(
+            today=now.strftime("%B %d, %Y"),
+            year=now.strftime("%Y"),
+        )
         agent = Agent(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=prompt_with_date,
             tools=[web_search],
             model=SONNET_MODEL_ID,
             callback_handler=None,
@@ -177,11 +164,14 @@ async def research_customer(payload, context):
 
         stream = agent.stream_async(full_prompt)
         async for event in stream:
-            yield event
-
-    except Exception as e:
+            yiept Exception as e:
         yield {"text": f"Error: {e}", "type": "error"}
 
-
-if __name__ == "__main__":
-    app.run()
+    try:
+        now = datetime.now()
+        prompt_with_date = SYSTEM_PROMPT.format(
+            today=now.strftime("%B %d, %Y"),
+            year=now.strftime("%Y"),
+        )
+        agent = Agent(
+            system_prompt=prompt_with_date,
