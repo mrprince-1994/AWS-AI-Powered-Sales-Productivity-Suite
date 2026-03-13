@@ -232,9 +232,18 @@ class CallNotesApp:
         self.export_pdf_btn.pack(side=tk.LEFT)
 
         # Transcript
-        ctk.CTkLabel(card, text="Live Transcript",
+        transcript_header = ctk.CTkFrame(card, fg_color="transparent")
+        transcript_header.pack(fill=tk.X, padx=16, pady=(4, 4))
+        ctk.CTkLabel(transcript_header, text="Live Transcript",
                      font=ctk.CTkFont("Segoe UI", 12, "bold"),
-                     text_color=ACCENT).pack(anchor=tk.W, padx=16, pady=(4, 4))
+                     text_color=ACCENT).pack(side=tk.LEFT)
+        self.copy_transcript_btn = ctk.CTkButton(
+            transcript_header, text="📋 Copy Transcript", width=130, height=28,
+            fg_color=BG_INPUT, hover_color=BG_CARD, text_color=FG_TEXT,
+            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+            border_width=1, border_color=BORDER, state=tk.DISABLED,
+            command=self._copy_transcript)
+        self.copy_transcript_btn.pack(side=tk.RIGHT)
         self.transcript_text = StyledText(card, height=8, font=("Consolas", 10))
         self.transcript_text.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 8))
 
@@ -438,6 +447,7 @@ class CallNotesApp:
         self.customer_var.set(item["customer_name"])
         self.export_docx_btn.configure(state=tk.NORMAL)
         self.export_pdf_btn.configure(state=tk.NORMAL)
+        self.copy_transcript_btn.configure(state=tk.NORMAL if self._current_transcript else tk.DISABLED)
         self.copy_email_btn.configure(state=tk.NORMAL if self._current_email else tk.DISABLED)
         self.status_var.set(f"Loaded session from {item['timestamp'][:16]}")
 
@@ -459,6 +469,15 @@ class CallNotesApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(clean)
         self.status_var.set("📋 Email copied to clipboard!")
+
+    def _copy_transcript(self):
+        transcript = self._current_transcript.strip()
+        if not transcript:
+            messagebox.showinfo("Nothing to copy", "No transcript available.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(transcript)
+        self.status_var.set("📋 Transcript copied to clipboard!")
 
     def _export_docx(self):
         if not self._current_notes:
@@ -594,6 +613,7 @@ class CallNotesApp:
         self.export_docx_btn.configure(state=tk.DISABLED)
         self.export_pdf_btn.configure(state=tk.DISABLED)
         self.copy_email_btn.configure(state=tk.DISABLED)
+        self.copy_transcript_btn.configure(state=tk.DISABLED)
 
         self.transcriber = LiveTranscriber(
             system_device=system_dev, mic_device=mic_dev,
@@ -682,6 +702,7 @@ class CallNotesApp:
         self.root.after(0, lambda: self.status_var.set(f"Notes saved: {results['filepath']}"))
         self.root.after(0, lambda: self.export_docx_btn.configure(state=tk.NORMAL))
         self.root.after(0, lambda: self.export_pdf_btn.configure(state=tk.NORMAL))
+        self.root.after(0, lambda: self.copy_transcript_btn.configure(state=tk.NORMAL))
         self.root.after(0, lambda: self.copy_email_btn.configure(
             state=tk.NORMAL if results["email"] else tk.DISABLED))
         self.root.after(0, self._refresh_history)
