@@ -103,7 +103,7 @@ def generate_notes(transcript: str, customer_name: str, on_chunk=None) -> str:
     return "".join(full_text)
 
 EMAIL_SYSTEM_PROMPT = """You are a professional follow-up email writer for business meetings.
-Given meeting notes from a call, generate a polished follow-up email that can be sent to the
+Given a raw transcript of a call, generate a polished follow-up email that can be sent to the
 attendees. The email should:
 
 1. Start with a warm greeting and thank them for their time
@@ -113,8 +113,15 @@ attendees. The email should:
 5. Close professionally with an offer to clarify anything
 
 Keep the tone professional but warm — like a Solutions Architect following up with a customer.
-Use plain text formatting suitable for pasting into Outlook (no markdown headers, use dashes
-for bullets). Keep it concise — ideally under 300 words. Do NOT include a subject line in the
+
+CRITICAL FORMATTING RULES — this email will be pasted directly into Outlook:
+- Do NOT use any markdown formatting whatsoever. No **, no *, no ##, no __, no backticks.
+- For section headers, just write them on their own line in plain text (e.g. "Action Items")
+- For bullet lists, use a simple dash followed by a space (e.g. "- Item here")
+- For emphasis, rely on word choice and sentence structure, NOT formatting characters
+- The output must be 100% plain text with zero special formatting syntax
+
+Keep it concise — ideally under 300 words. Do NOT include a subject line in the
 body — just the email body starting with the greeting.
 
 Also generate a suggested subject line on the very first line in this format:
@@ -123,8 +130,8 @@ Subject: <your suggested subject line>
 Then a blank line, then the email body."""
 
 
-def generate_followup_email(notes: str, customer_name: str, on_chunk=None) -> str:
-    """Generate a follow-up email from meeting notes using Claude on Bedrock."""
+def generate_followup_email(transcript: str, customer_name: str, on_chunk=None) -> str:
+    """Generate a follow-up email from a call transcript using Claude on Bedrock."""
     client = boto3.client(
         "bedrock-runtime",
         region_name=AWS_REGION,
@@ -138,7 +145,7 @@ def generate_followup_email(notes: str, customer_name: str, on_chunk=None) -> st
         "messages": [
             {
                 "role": "user",
-                "content": f"Customer: {customer_name}\n\nMeeting Notes:\n{notes}",
+                "content": f"Customer: {customer_name}\n\nCall Transcript:\n{transcript}",
             }
         ],
     }

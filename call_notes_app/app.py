@@ -448,8 +448,16 @@ class CallNotesApp:
         if not email:
             messagebox.showinfo("Nothing to copy", "No follow-up email generated yet.")
             return
+        # Strip any residual markdown formatting for clean Outlook paste
+        import re
+        clean = re.sub(r'\*\*(.+?)\*\*', r'\1', email)   # **bold**
+        clean = re.sub(r'__(.+?)__', r'\1', clean)        # __bold__
+        clean = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', clean)  # *italic*
+        clean = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'\1', clean)       # _italic_
+        clean = re.sub(r'^#{1,6}\s+', '', clean, flags=re.MULTILINE)  # ## headers
+        clean = re.sub(r'`(.+?)`', r'\1', clean)          # `code`
         self.root.clipboard_clear()
-        self.root.clipboard_append(email)
+        self.root.clipboard_append(clean)
         self.status_var.set("📋 Email copied to clipboard!")
 
     def _export_docx(self):
@@ -617,45 +625,70 @@ class CallNotesApp:
             messagebox.showinfo("Empty", "No transcript was captured.")
             return
 
-        self.status_var.set("Generating notes with Claude...")
+        self.status_var.set("Generating notes & follow-up email...")
         threading.Thread(target=self._generate_and_save, args=(transcript,),
                          daemon=True).start()
 
     def _generate_and_save(self, transcript):
         customer = self.customer_var.get().strip()
         self.root.after(0, self._prepare_notes_for_streaming)
+        self.root.after(0, self._prepare_email_for_streaming)
 
-        def on_chunk(text):
-            self.root.after(0, self._append_notes_chunk, text)
+        # Shared state for parallel results
+        results = {"notes": None, "email": None, "filepath": None,
+                   "notes_error": None, "email_error": None}
+
+        def run_notes():
+            try:
+                def on_chunk(text):
+                    self.root.after(0, self._append_notes_chunk, text)
+                notes = generate_notes(transcript, customer, on_chunk=on_chunk)
+                results["notes"] = notes
+                self._current_notes = notes
+                results["filepath"] = save_notes(customer, notes)
+            except Exception as e:
+                results["notes_error"] = e
+
+        def run_email():
+            try:
+                def on_email_chunk(text):
+                    self.root.after(0, self._append_email_chunk, text)
+                email = generate_followup_email(transcript, customer, on_chunk=on_email_chunk)
+                results["email"] = email
+                self._current_email = email
+            except Exception as e:
+                results["email_error"] = e
+
+        notes_thread = threading.Thread(target=run_notes, daemon=True)
+        email_thread = threading.Thread(target=run_email, daemon=True)
+        notes_thread.start()
+        email_thread.start()
+        notes_thread.join()
+        email_thread.join()
+
+        if results["notes_error"]:
+            self.root.after(0, lambda: messagebox.showerror(
+                "Error", f"Failed to generate notes:\n{results['notes_error']}"))
+            self.root.after(0, lambda: self.status_var.set("Error generating notes."))
+            return
 
         try:
-            notes = generate_notes(transcript, customer, on_chunk=on_chunk)
-            self._current_notes = notes
-            filepath = save_notes(customer, notes)
+            save_session(customer, transcript,
+                         results["notes"] or "", results["filepath"] or "",
+                         followup_email=results["email"] or "")
+        except Exception:
+            pass
 
-            # Generate follow-up email from the notes
-            self.root.after(0, lambda: self.status_var.set("Generating follow-up email..."))
-            self.root.after(0, self._prepare_email_for_streaming)
+        self.root.after(0, lambda: self.status_var.set(f"Notes saved: {results['filepath']}"))
+        self.root.after(0, lambda: self.export_docx_btn.configure(state=tk.NORMAL))
+        self.root.after(0, lambda: self.export_pdf_btn.configure(state=tk.NORMAL))
+        self.root.after(0, lambda: self.copy_email_btn.configure(
+            state=tk.NORMAL if results["email"] else tk.DISABLED))
+        self.root.after(0, self._refresh_history)
 
-            def on_email_chunk(text):
-                self.root.after(0, self._append_email_chunk, text)
-
-            email = generate_followup_email(notes, customer, on_chunk=on_email_chunk)
-            self._current_email = email
-
-            try:
-                save_session(customer, transcript, notes, filepath, followup_email=email)
-            except Exception:
-                pass
-            self.root.after(0, lambda: self.status_var.set(f"Notes saved: {filepath}"))
-            self.root.after(0, lambda: self.export_docx_btn.configure(state=tk.NORMAL))
-            self.root.after(0, lambda: self.export_pdf_btn.configure(state=tk.NORMAL))
-            self.root.after(0, lambda: self.copy_email_btn.configure(state=tk.NORMAL))
-            self.root.after(0, self._refresh_history)
-        except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror(
-                "Error", f"Failed to generate notes:\n{e}"))
-            self.root.after(0, lambda: self.status_var.set("Error generating notes."))
+        if results["email_error"]:
+            self.root.after(0, lambda: self.status_var.set(
+                f"Notes saved but email failed: {results['email_error']}"))
 
     def _prepare_notes_for_streaming(self):
         self.notes_text.config(state=tk.NORMAL)
@@ -864,15 +897,14 @@ class NotesRetrieverTab:
         ctk.CTkLabel(filter_row, text="Customer:",
                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
         self.customer_filter_var = tk.StringVar(value="(All)")
-        self.customer_combo = ctk.CTkComboBox(
-            filter_row, variable=self.customer_filter_var, width=200,
-            fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
-            button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
-            dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
-            values=["(All)"],
-            command=lambda _: self._new_chat())
-        self.customer_combo.pack(side=tk.LEFT, padx=(8, 0))
+        self._customer_values = ["(All)"]
+        self.customer_btn = ctk.CTkButton(
+            filter_row, textvariable=self.customer_filter_var, width=200,
+            fg_color=BG_INPUT, hover_color=BG_CARD, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+            border_width=1, border_color=BORDER, anchor="w",
+            command=self._open_customer_picker)
+        self.customer_btn.pack(side=tk.LEFT, padx=(8, 0))
         ctk.CTkLabel(filter_row,
                      text="  (changing filters starts a new chat)",
                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
@@ -985,6 +1017,73 @@ class NotesRetrieverTab:
     def _use_suggestion(self, prompt):
         self.input_var.set(prompt)
         self._send()
+
+    def _open_customer_picker(self):
+        """Open a scrollable, searchable popup for customer selection."""
+        popup = tk.Toplevel()
+        popup.title("Select Customer")
+        popup.geometry("300x400")
+        popup.configure(bg=BG_DARK)
+        popup.transient()
+        popup.grab_set()
+
+        # Position near the button
+        bx = self.customer_btn.winfo_rootx()
+        by = self.customer_btn.winfo_rooty() + self.customer_btn.winfo_height()
+        popup.geometry(f"+{bx}+{by}")
+
+        # Search entry
+        search_var = tk.StringVar()
+        search_entry = ctk.CTkEntry(
+            popup, textvariable=search_var, placeholder_text="Type to filter...",
+            fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
+            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6, height=32)
+        search_entry.pack(fill=tk.X, padx=8, pady=(8, 4))
+        search_entry.focus()
+
+        # Scrollable listbox
+        lf = ctk.CTkFrame(popup, fg_color=BG_INPUT, corner_radius=8,
+                           border_width=1, border_color=BORDER)
+        lf.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        listbox = tk.Listbox(
+            lf, exportselection=False, bg=BG_INPUT, fg=FG_TEXT,
+            selectbackground=ACCENT, selectforeground=BG_DARK,
+            font=("Segoe UI", 11), borderwidth=0, highlightthickness=0,
+            activestyle="none")
+        scrollbar = ctk.CTkScrollbar(lf, command=listbox.yview, fg_color=BG_INPUT,
+                                      button_color=BORDER, button_hover_color=ACCENT)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=4)
+
+        all_values = list(self._customer_values)
+
+        def populate(filter_text=""):
+            listbox.delete(0, tk.END)
+            ft = filter_text.lower()
+            for v in all_values:
+                if not ft or ft in v.lower():
+                    listbox.insert(tk.END, v)
+
+        def on_search(*_):
+            populate(search_var.get())
+
+        def on_select(event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            chosen = listbox.get(sel[0])
+            self.customer_filter_var.set(chosen)
+            popup.destroy()
+            self._new_chat()
+
+        search_var.trace_add("write", on_search)
+        listbox.bind("<<ListboxSelect>>", lambda e: popup.after(150, on_select))
+        listbox.bind("<Return>", on_select)
+        search_entry.bind("<Return>", lambda e: on_select())
+        popup.bind("<Escape>", lambda e: popup.destroy())
+
+        populate()
 
     def _new_chat(self):
         """Reset conversation history and clear the chat display."""
@@ -1178,10 +1277,10 @@ class NotesRetrieverTab:
                 canonical_set[key] = canon
         customers = ["(All)"] + sorted(canonical_set.values(), key=str.lower)
 
-        self.customer_combo.after(0, lambda: self._update_index_ui(all_notes, customers))
+        self.customer_btn.after(0, lambda: self._update_index_ui(all_notes, customers))
 
     def _update_index_ui(self, all_notes, customers):
-        self.customer_combo.configure(values=customers)
+        self._customer_values = customers
         count = len(all_notes)
         self.index_label.configure(
             text=f"{count} note{'s' if count != 1 else ''} indexed")
