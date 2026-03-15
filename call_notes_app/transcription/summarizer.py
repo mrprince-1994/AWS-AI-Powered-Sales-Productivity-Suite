@@ -315,3 +315,62 @@ def extract_competitors(notes: str, customer_name: str) -> list:
         print(f"[competitor extract] Error: {e}")
 
     return []
+
+ACTION_ITEMS_PROMPT = """You are a task extraction assistant. Given meeting notes, extract all action items,
+follow-ups, and commitments that were made.
+
+Return ONLY valid JSON — an array of objects. If no action items found, return [].
+
+Each object should have:
+{
+  "task": "Clear description of what needs to be done",
+  "owner": "Person responsible (use the name mentioned, or 'Me' if it's the note-taker's task)",
+  "due": "Due date or timeframe if mentioned (e.g. 'by Friday', 'next week', '2 weeks'), or 'No deadline' if none specified",
+  "priority": "high | medium | low — based on urgency language used"
+}
+
+Look for:
+- Explicit action items ("I'll send you...", "Can you follow up on...")
+- Commitments ("We'll schedule a demo", "I'll loop in our SA")
+- Follow-ups ("Let's reconnect next week", "I'll share the doc by Friday")
+- Requests ("Can you send me the pricing?", "We need to get approval from...")
+
+Be thorough — capture every commitment from both sides."""
+
+
+def extract_action_items(notes: str, customer_name: str) -> list:
+    """Extract action items from call notes. Returns list of dicts."""
+    client = boto3.client(
+        "bedrock-runtime", region_name=AWS_REGION,
+        config=Config(read_timeout=120),
+    )
+
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 2048,
+        "system": ACTION_ITEMS_PROMPT,
+        "messages": [{
+            "role": "user",
+            "content": f"Customer: {customer_name}\n\nMeeting Notes:\n{notes}",
+        }],
+    }
+
+    try:
+        response = client.invoke_model(
+            modelId=CLAUDE_MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(payload),
+        )
+        result = json.loads(response["body"].read())
+        text = result["content"][0]["text"]
+
+        import re
+        start = text.find('[')
+        end = text.rfind(']') + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+    except Exception as e:
+        print(f"[action items extract] Error: {e}")
+
+    return []
