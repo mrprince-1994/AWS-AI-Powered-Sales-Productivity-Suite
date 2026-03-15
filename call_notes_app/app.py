@@ -3,7 +3,7 @@ from tkinter import messagebox, filedialog
 import customtkinter as ctk
 import threading
 from transcription.transcriber import LiveTranscriber
-from transcription.summarizer import generate_notes, generate_followup_email
+from transcription.summarizer import generate_notes, generate_followup_email, generate_prep_summary
 from transcription.storage import save_notes, _md_to_docx
 from transcription.history import save_session, list_sessions, get_all_customers
 from transcription.question_detector import is_aws_aiml_question, extract_question
@@ -235,6 +235,13 @@ class CallNotesApp:
             height=34, border_width=1, border_color=BORDER, state=tk.DISABLED,
             command=self._export_pdf)
         self.export_pdf_btn.pack(side=tk.LEFT)
+
+        self.prep_btn = ctk.CTkButton(
+            bf, text="📋 Pre-Call Prep", fg_color=BG_INPUT, hover_color=BG_CARD,
+            text_color=ACCENT, font=ctk.CTkFont("Segoe UI", 11, "bold"), corner_radius=8,
+            height=34, border_width=1, border_color=ACCENT,
+            command=self._generate_prep)
+        self.prep_btn.pack(side=tk.RIGHT)
 
         # Transcript
         transcript_header = ctk.CTkFrame(card, fg_color="transparent")
@@ -782,6 +789,92 @@ class CallNotesApp:
     def _prepare_notes_for_streaming(self):
         self.notes_text.config(state=tk.NORMAL)
         self.notes_text.delete("1.0", tk.END)
+
+    def _generate_prep(self):
+        customer = self.customer_var.get().strip()
+        if not customer:
+            messagebox.showwarning("Missing Info", "Enter a customer name first.")
+            return
+
+        self.prep_btn.configure(state=tk.DISABLED, text="⏳ Loading...")
+        self.status_var.set(f"Generating pre-call prep for {customer}...")
+
+        # Clear AI panel and show status
+        self.ai_text.config(state=tk.NORMAL)
+        self.ai_text.delete("1.0", tk.END)
+        self.ai_text.insert(tk.END, f"📋 Pre-Call Prep: {customer}\n", "question")
+        self.ai_text.insert(tk.END, "⏳ Loading previous sessions...\n", "status")
+        self.ai_text.config(state=tk.DISABLED)
+
+        def run():
+            try:
+                # Get last 3 sessions for this customer
+                sessions = list_sessions(customer)[:3]
+                if not sessions:
+                    self.root.after(0, self._prep_no_history, customer)
+                    return
+
+                self.root.after(0, lambda: self._prep_update_status(
+                    f"Found {len(sessions)} session(s). Generating prep brief..."))
+
+                self._prep_streaming_started = False
+                self._prep_md_streamer = MarkdownStreamer(self.ai_text)
+
+                def on_chunk(text):
+                    self.root.after(0, self._prep_append_chunk, text)
+
+                generate_prep_summary(sessions, customer, on_chunk=on_chunk)
+
+                self.root.after(0, self._prep_finish)
+            except Exception as e:
+                self.root.after(0, lambda: self._prep_error(str(e)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _prep_no_history(self, customer):
+        self.ai_text.config(state=tk.NORMAL)
+        pos = self.ai_text.search("⏳ Loading", "1.0", tk.END)
+        if pos:
+            self.ai_text.delete(pos, f"{pos} lineend+1c")
+        self.ai_text.insert(tk.END, f"No previous sessions found for {customer}.\n", "status")
+        self.ai_text.config(state=tk.DISABLED)
+        self.prep_btn.configure(state=tk.NORMAL, text="📋 Pre-Call Prep")
+        self.status_var.set("No history found for this customer.")
+
+    def _prep_update_status(self, msg):
+        self.ai_text.config(state=tk.NORMAL)
+        pos = self.ai_text.search("⏳", "1.0", tk.END)
+        if pos:
+            self.ai_text.delete(pos, f"{pos} lineend+1c")
+        self.ai_text.insert(tk.END, f"⏳ {msg}\n", "status")
+        self.ai_text.config(state=tk.DISABLED)
+
+    def _prep_append_chunk(self, text):
+        self.ai_text.config(state=tk.NORMAL)
+        if not self._prep_streaming_started:
+            self._prep_streaming_started = True
+            pos = self.ai_text.search("⏳", "1.0", tk.END)
+            if pos:
+                self.ai_text.delete(pos, f"{pos} lineend+1c")
+        self._prep_md_streamer.feed(text)
+        self.ai_text.see(tk.END)
+        self.ai_text.config(state=tk.DISABLED)
+
+    def _prep_finish(self):
+        self.ai_text.config(state=tk.NORMAL)
+        if hasattr(self, '_prep_md_streamer'):
+            self._prep_md_streamer.flush()
+        self.ai_text.see(tk.END)
+        self.ai_text.config(state=tk.DISABLED)
+        self.prep_btn.configure(state=tk.NORMAL, text="📋 Pre-Call Prep")
+        self.status_var.set("Pre-call prep ready.")
+
+    def _prep_error(self, error):
+        self.ai_text.config(state=tk.NORMAL)
+        self.ai_text.insert(tk.END, f"\n⚠️ Error: {error}\n", "status")
+        self.ai_text.config(state=tk.DISABLED)
+        self.prep_btn.configure(state=tk.NORMAL, text="📋 Pre-Call Prep")
+        self.status_var.set("Prep generation failed.")
 
     def _append_notes_chunk(self, text):
         self.notes_text.config(state=tk.NORMAL)

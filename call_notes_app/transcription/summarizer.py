@@ -180,3 +180,78 @@ def generate_followup_email(transcript: str, customer_name: str, on_chunk=None) 
                     on_chunk(text)
 
     return "".join(full_text)
+
+PREP_SYSTEM_PROMPT = """You are a sales productivity assistant preparing a pre-call brief.
+Given notes from previous calls with a customer, produce a concise prep summary that helps
+the salesperson walk into their next call fully prepared.
+
+Structure the brief as follows:
+
+LAST MEETING RECAP
+A 2-3 sentence summary of the most recent call — what was discussed and the overall status.
+
+WHERE WE LEFT OFF
+The key topics, decisions, and direction from the last interaction. What was the customer's
+state of mind? What were they excited about or concerned about?
+
+OUTSTANDING ACTION ITEMS
+List every action item that was committed to (by either side) that may still be open.
+Include the owner and any deadlines mentioned. Flag items that are overdue.
+
+OPEN QUESTIONS
+Anything that was raised but not resolved, or that needs follow-up.
+
+PROMISES MADE
+Anything you or your team committed to delivering — demos, documents, introductions,
+follow-up meetings, etc.
+
+SUGGESTED TALKING POINTS
+Based on the history, suggest 3-5 things to bring up or ask about in the upcoming call.
+
+Keep it scannable — use short bullets, not paragraphs. This should be a 60-second read
+that gets someone fully up to speed. Do NOT use markdown formatting (no **, ##, etc.).
+Use plain text with dashes for bullets."""
+
+
+def generate_prep_summary(notes_list: list, customer_name: str, on_chunk=None) -> str:
+    """Generate a pre-call prep summary from recent session notes."""
+    combined = "\n\n---\n\n".join(
+        f"Session from {n.get('timestamp', 'unknown')[:16]}:\n{n.get('notes', '')}"
+        for n in notes_list
+    )
+
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=AWS_REGION,
+        config=Config(read_timeout=300),
+    )
+
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "system": PREP_SYSTEM_PROMPT,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Customer: {customer_name}\n\nPrevious call notes (most recent first):\n\n{combined}",
+            }
+        ],
+    }
+    response = client.invoke_model_with_response_stream(
+        modelId=CLAUDE_MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(payload),
+    )
+
+    full_text = []
+    for event in response["body"]:
+        chunk = json.loads(event["chunk"]["bytes"])
+        if chunk.get("type") == "content_block_delta":
+            text = chunk["delta"].get("text", "")
+            if text:
+                full_text.append(text)
+                if on_chunk:
+                    on_chunk(text)
+
+    return "".join(full_text)
