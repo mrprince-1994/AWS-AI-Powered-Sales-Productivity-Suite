@@ -108,7 +108,7 @@ MEETING AGENDA PRINCIPLES:
 def _research_company(company_name: str, domain: str, on_status=None) -> dict:
     """Call Claude to research the company and return structured JSON."""
     if on_status:
-        on_status("Researching company...")
+        on_status("🔍 Sending research request to Claude...")
 
     client = boto3.client(
         "bedrock-runtime", region_name=AWS_REGION,
@@ -125,12 +125,18 @@ def _research_company(company_name: str, domain: str, on_status=None) -> dict:
         }],
     }
 
+    if on_status:
+        on_status("🧠 Claude is researching (this takes 30-60s)...")
+
     response = client.invoke_model(
         modelId=MODEL_ID,
         contentType="application/json",
         accept="application/json",
         body=json.dumps(payload),
     )
+
+    if on_status:
+        on_status("📥 Parsing research results...")
 
     result = json.loads(response["body"].read())
     text = result["content"][0]["text"]
@@ -143,6 +149,9 @@ def _research_company(company_name: str, domain: str, on_status=None) -> dict:
     end = text.rfind('}') + 1
     if start >= 0 and end > start:
         text = text[start:end]
+
+    if on_status:
+        on_status("✅ Research complete, building document...")
 
     return json.loads(text)
 
@@ -168,7 +177,7 @@ def _add_table(doc, headers, rows):
 def _build_docx(data: dict, on_status=None) -> str:
     """Build a formatted DOCX brief from the research data. Returns file path."""
     if on_status:
-        on_status("Building document...")
+        on_status("📄 Building title page...")
 
     company = data.get("company_name", "Company")
     doc = Document()

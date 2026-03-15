@@ -1705,6 +1705,20 @@ class CustomerResearchTab:
 
     # ── Brief generation ──
 
+    _BRIEF_STEPS = [
+        "🔍 Researching company profile...",
+        "👥 Identifying leadership team...",
+        "💻 Analyzing technology landscape...",
+        "🤖 Mapping AI/ML use cases...",
+        "📊 Pulling AWS customer references...",
+        "🗺️ Aligning AWS solutions...",
+        "⚔️ Assessing competitive context...",
+        "📝 Generating discovery questions...",
+        "📋 Building meeting agenda...",
+        "📄 Compiling document...",
+    ]
+    _BRIEF_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
     def _generate_brief(self):
         company = self.brief_company_var.get().strip()
         domain = self.brief_domain_var.get().strip()
@@ -1713,24 +1727,54 @@ class CustomerResearchTab:
             messagebox.showwarning("Missing Info", "Please enter both company name and domain.")
             return
         self.brief_generate_btn.configure(state=tk.DISABLED, text="⏳ Generating...")
-        self.brief_status_var.set("Starting research...")
+        self._brief_active = True
+        self._brief_tick = 0
+        self._brief_start_ms = int(self.brief_status_label.tk.call("clock", "milliseconds"))
+        self._brief_last_status = ""
+        self._tick_brief_animation()
 
         def run():
             try:
                 from retrieval.customer_brief import generate_customer_brief
 
                 def on_status(msg):
-                    self.brief_generate_btn.after(0, lambda: self.brief_status_var.set(msg))
+                    self._brief_last_status = msg
 
                 filepath = generate_customer_brief(company, domain, on_status=on_status)
+                self._brief_active = False
                 self.brief_generate_btn.after(0, lambda: self.brief_status_var.set(f"✅ Saved:\n{filepath}"))
             except Exception as e:
+                self._brief_active = False
                 self.brief_generate_btn.after(0, lambda: self.brief_status_var.set(f"❌ Error: {e}"))
             finally:
+                self._brief_active = False
                 self.brief_generate_btn.after(0, lambda: self.brief_generate_btn.configure(
                     state=tk.NORMAL, text="📄  Create Customer Brief"))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _tick_brief_animation(self):
+        if not self._brief_active:
+            return
+        now_ms = int(self.brief_status_label.tk.call("clock", "milliseconds"))
+        elapsed = (now_ms - self._brief_start_ms) // 1000
+        mins, secs = divmod(elapsed, 60)
+        timer = f"{mins}:{secs:02d}" if mins else f"{secs}s"
+
+        # Advance step every ~5 seconds
+        step_idx = min(self._brief_tick // 10, len(self._BRIEF_STEPS) - 1)
+        step_text = self._BRIEF_STEPS[step_idx]
+        spinner = self._BRIEF_SPINNER[self._brief_tick % len(self._BRIEF_SPINNER)]
+
+        # Show real status from the backend if available
+        if self._brief_last_status:
+            display = f"{spinner} {self._brief_last_status}  [{timer}]"
+        else:
+            display = f"{spinner} {step_text}  [{timer}]"
+
+        self._brief_tick += 1
+        self.brief_status_var.set(display)
+        self.brief_status_label.after(500, self._tick_brief_animation)
 
     # ── Actions ──
 
