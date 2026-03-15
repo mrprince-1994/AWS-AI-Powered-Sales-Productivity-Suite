@@ -2222,13 +2222,17 @@ class CustomerResearchTab:
 
 
 class InsightsTab:
-    """Tab 4 — Call Analytics + Competitive Intelligence dashboard."""
+    """Tab 4 — Call Analytics + Competitive Intelligence with matplotlib charts."""
 
     def __init__(self, parent):
+        self._parent = parent
         self._build_ui(parent)
         threading.Thread(target=self._refresh_data, daemon=True).start()
 
     def _build_ui(self, parent):
+        import matplotlib
+        matplotlib.use("Agg")
+
         top = ctk.CTkFrame(parent, fg_color="transparent")
         top.pack(fill=tk.X, padx=16, pady=(14, 6))
 
@@ -2249,134 +2253,217 @@ class InsightsTab:
             font=ctk.CTkFont("Segoe UI", 10))
         self.status_label.pack(side=tk.RIGHT, padx=(0, 12))
 
-        # Two-column layout
+        # Stats row
+        self._stats_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self._stats_frame.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        # Charts area — scrollable
         body = ctk.CTkFrame(parent, fg_color="transparent")
         body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
 
-        # Left: Call Analytics
-        left = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=12,
-                             border_width=1, border_color=BORDER)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        # 4 chart slots in a 2x2 grid
+        self._chart_frames = []
+        for r in range(2):
+            for c in range(2):
+                frame = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=12,
+                                      border_width=1, border_color=BORDER)
+                frame.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
+                self._chart_frames.append(frame)
 
-        ctk.CTkLabel(left, text="📈  Call Analytics",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
-                     text_color=ACCENT).pack(anchor=tk.W, padx=14, pady=(14, 8))
-
-        self.analytics_text = StyledText(left, font=("Segoe UI", 10))
-        self.analytics_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
-
-        # Right: Competitive Intel
-        right = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=12,
-                              border_width=1, border_color=BORDER)
-        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-
-        ctk.CTkLabel(right, text="⚔️  Competitive Intelligence",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
-                     text_color=ACCENT).pack(anchor=tk.W, padx=14, pady=(14, 8))
-
-        self.intel_text = StyledText(right, font=("Segoe UI", 10))
-        self.intel_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+    def _make_stat_card(self, parent, label, value, color=ACCENT):
+        card = ctk.CTkFrame(parent, fg_color=BG_PANEL, corner_radius=10,
+                             border_width=1, border_color=BORDER, width=160, height=70)
+        card.pack(side=tk.LEFT, padx=(0, 8), fill=tk.Y)
+        card.pack_propagate(False)
+        ctk.CTkLabel(card, text=str(value), font=ctk.CTkFont("Segoe UI", 22, "bold"),
+                     text_color=color).pack(padx=12, pady=(10, 0))
+        ctk.CTkLabel(card, text=label, font=ctk.CTkFont("Segoe UI", 10),
+                     text_color=FG_DIM).pack(padx=12, pady=(0, 8))
 
     def _refresh_data(self):
-        # Gather analytics
         try:
             from transcription.history import list_sessions
             from transcription.competitive_intel import get_all_mentions, get_competitor_summary
             from datetime import datetime, timedelta
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            import numpy as np
 
             all_sessions = list_sessions()
             now = datetime.now()
-
-            # Time-based filters
             week_ago = (now - timedelta(days=7)).isoformat()
             month_ago = (now - timedelta(days=30)).isoformat()
             this_week = [s for s in all_sessions if s.get("timestamp", "") >= week_ago]
             this_month = [s for s in all_sessions if s.get("timestamp", "") >= month_ago]
 
-            # Customer frequency
             customer_counts = {}
             for s in all_sessions:
                 c = s.get("customer_name", "Unknown")
                 customer_counts[c] = customer_counts.get(c, 0) + 1
             top_customers = sorted(customer_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
-            # Monthly customer counts
-            monthly_customers = {}
-            for s in this_month:
-                c = s.get("customer_name", "Unknown")
-                monthly_customers[c] = monthly_customers.get(c, 0) + 1
-
-            # Build analytics text
-            lines = []
-            lines.append(f"OVERVIEW")
-            lines.append(f"  Total sessions:     {len(all_sessions)}")
-            lines.append(f"  This week:          {len(this_week)}")
-            lines.append(f"  This month:         {len(this_month)}")
-            lines.append(f"  Unique customers:   {len(customer_counts)}")
-            lines.append("")
-            lines.append(f"THIS WEEK ({len(this_week)} calls)")
-            for s in this_week[:10]:
+            # Daily call counts for the past 14 days
+            daily_counts = {}
+            for i in range(14):
+                day = (now - timedelta(days=13 - i)).strftime("%m/%d")
+                daily_counts[day] = 0
+            for s in all_sessions:
                 ts = s.get("timestamp", "")[:10]
-                lines.append(f"  - {s.get('customer_name', '?')}  ({ts})")
-            lines.append("")
-            lines.append("TOP CUSTOMERS (all time)")
-            for name, count in top_customers:
-                bar = "█" * min(count, 20)
-                lines.append(f"  {name:<25} {bar} {count}")
-            lines.append("")
-            lines.append(f"THIS MONTH — {len(monthly_customers)} unique customers")
-            for name, count in sorted(monthly_customers.items(), key=lambda x: x[1], reverse=True)[:10]:
-                lines.append(f"  - {name} ({count} call{'s' if count > 1 else ''})")
+                try:
+                    d = datetime.fromisoformat(ts)
+                    if (now - d).days <= 13:
+                        key = d.strftime("%m/%d")
+                        if key in daily_counts:
+                            daily_counts[key] += 1
+                except Exception:
+                    pass
 
-            analytics = "\n".join(lines)
-
-            # Competitive intel
             comp_summary = get_competitor_summary()
             all_mentions = get_all_mentions(limit=50)
 
-            intel_lines = []
-            if comp_summary:
-                intel_lines.append("COMPETITOR FREQUENCY")
-                for comp, count in list(comp_summary.items())[:15]:
-                    bar = "█" * min(count, 20)
-                    intel_lines.append(f"  {comp:<25} {bar} {count}")
-                intel_lines.append("")
-                intel_lines.append("RECENT MENTIONS")
-                for m in all_mentions[:20]:
-                    ts = m.get("timestamp", "")[:10]
-                    cust = m.get("customer", "?")
-                    comp = m.get("competitor", "?")
-                    sentiment = m.get("sentiment", "")
-                    icon = {"positive": "👍", "negative": "👎", "neutral": "➖"}.get(sentiment, "➖")
-                    context = m.get("context", "")[:80]
-                    intel_lines.append(f"  {icon} {comp} — {cust} ({ts})")
-                    if context:
-                        intel_lines.append(f"     {context}")
-            else:
-                intel_lines.append("No competitor mentions tracked yet.")
-                intel_lines.append("")
-                intel_lines.append("Competitor mentions are automatically extracted")
-                intel_lines.append("from call notes after each recording session.")
-
-            intel = "\n".join(intel_lines)
-
-            # Update UI
-            self.analytics_text.after(0, lambda: self._update_panel(self.analytics_text, analytics))
-            self.intel_text.after(0, lambda: self._update_panel(self.intel_text, intel))
-            self.status_label.after(0, lambda: self.status_label.configure(
-                text=f"Updated {now.strftime('%H:%M')}"))
+            # Build charts on main thread
+            self._parent.after(0, lambda: self._render_charts(
+                all_sessions, this_week, this_month, customer_counts,
+                top_customers, daily_counts, comp_summary, all_mentions, now))
 
         except Exception as e:
             self.status_label.after(0, lambda: self.status_label.configure(text=f"Error: {e}"))
 
-    def _update_panel(self, widget, text):
-        widget.config(state=tk.NORMAL)
-        widget.delete("1.0", tk.END)
-        widget.insert(tk.END, text)
-        widget.config(state=tk.DISABLED)
+    def _render_charts(self, all_sessions, this_week, this_month, customer_counts,
+                       top_customers, daily_counts, comp_summary, all_mentions, now):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        # Dark theme for matplotlib
+        chart_bg = "#171717"
+        chart_fg = "#d1d5db"
+        accent = "#10a37f"
+        accent2 = "#6ee7b7"
+        red_color = "#ef4444"
+
+        # Clear stat cards
+        for w in self._stats_frame.winfo_children():
+            w.destroy()
+
+        # Stat cards
+        self._make_stat_card(self._stats_frame, "Total Calls", len(all_sessions))
+        self._make_stat_card(self._stats_frame, "This Week", len(this_week), "#6ee7b7")
+        self._make_stat_card(self._stats_frame, "This Month", len(this_month), "#60a5fa")
+        self._make_stat_card(self._stats_frame, "Customers", len(customer_counts), "#fbbf24")
+        comp_count = len(comp_summary) if comp_summary else 0
+        self._make_stat_card(self._stats_frame, "Competitors", comp_count, "#ef4444")
+
+        # Clear chart frames
+        for frame in self._chart_frames:
+            for w in frame.winfo_children():
+                w.destroy()
+
+        def embed_chart(frame, fig):
+            canvas = FigureCanvasTkAgg(fig, master=frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # Chart 1: Daily calls (line chart)
+        fig1 = Figure(figsize=(5, 3), dpi=90, facecolor=chart_bg)
+        ax1 = fig1.add_subplot(111)
+        ax1.set_facecolor(chart_bg)
+        days = list(daily_counts.keys())
+        counts = list(daily_counts.values())
+        ax1.fill_between(range(len(days)), counts, alpha=0.3, color=accent)
+        ax1.plot(range(len(days)), counts, color=accent, linewidth=2, marker='o', markersize=4)
+        ax1.set_xticks(range(0, len(days), 2))
+        ax1.set_xticklabels([days[i] for i in range(0, len(days), 2)], fontsize=7, color=chart_fg)
+        ax1.set_title("Calls — Last 14 Days", fontsize=10, color=chart_fg, pad=8)
+        ax1.tick_params(colors=chart_fg, labelsize=7)
+        ax1.spines['bottom'].set_color("#2d2d2d")
+        ax1.spines['left'].set_color("#2d2d2d")
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        fig1.tight_layout(pad=1.5)
+        embed_chart(self._chart_frames[0], fig1)
+
+        # Chart 2: Top customers (horizontal bar)
+        fig2 = Figure(figsize=(5, 3), dpi=90, facecolor=chart_bg)
+        ax2 = fig2.add_subplot(111)
+        ax2.set_facecolor(chart_bg)
+        if top_customers:
+            names = [n[:20] for n, _ in reversed(top_customers)]
+            vals = [v for _, v in reversed(top_customers)]
+            bars = ax2.barh(range(len(names)), vals, color=accent, height=0.6)
+            ax2.set_yticks(range(len(names)))
+            ax2.set_yticklabels(names, fontsize=7, color=chart_fg)
+            for bar, val in zip(bars, vals):
+                ax2.text(bar.get_width() + 0.2, bar.get_y() + bar.get_height()/2,
+                        str(val), va='center', fontsize=7, color=accent2)
+        ax2.set_title("Top Customers", fontsize=10, color=chart_fg, pad=8)
+        ax2.tick_params(colors=chart_fg, labelsize=7)
+        ax2.spines['bottom'].set_color("#2d2d2d")
+        ax2.spines['left'].set_color("#2d2d2d")
+        ax2.spines['top'].set_visible(False)
+        ax2.spines['right'].set_visible(False)
+        fig2.tight_layout(pad=1.5)
+        embed_chart(self._chart_frames[1], fig2)
+
+        # Chart 3: Competitor frequency (horizontal bar)
+        fig3 = Figure(figsize=(5, 3), dpi=90, facecolor=chart_bg)
+        ax3 = fig3.add_subplot(111)
+        ax3.set_facecolor(chart_bg)
+        if comp_summary:
+            top_comp = list(comp_summary.items())[:10]
+            cnames = [n[:20] for n, _ in reversed(top_comp)]
+            cvals = [v for _, v in reversed(top_comp)]
+            bars = ax3.barh(range(len(cnames)), cvals, color=red_color, height=0.6, alpha=0.8)
+            ax3.set_yticks(range(len(cnames)))
+            ax3.set_yticklabels(cnames, fontsize=7, color=chart_fg)
+            for bar, val in zip(bars, cvals):
+                ax3.text(bar.get_width() + 0.2, bar.get_y() + bar.get_height()/2,
+                        str(val), va='center', fontsize=7, color="#fca5a5")
+        else:
+            ax3.text(0.5, 0.5, "No competitor data yet", ha='center', va='center',
+                    fontsize=10, color=FG_DIM, transform=ax3.transAxes)
+        ax3.set_title("Competitor Mentions", fontsize=10, color=chart_fg, pad=8)
+        ax3.tick_params(colors=chart_fg, labelsize=7)
+        ax3.spines['bottom'].set_color("#2d2d2d")
+        ax3.spines['left'].set_color("#2d2d2d")
+        ax3.spines['top'].set_visible(False)
+        ax3.spines['right'].set_visible(False)
+        fig3.tight_layout(pad=1.5)
+        embed_chart(self._chart_frames[2], fig3)
+
+        # Chart 4: Sentiment breakdown (pie/donut)
+        fig4 = Figure(figsize=(5, 3), dpi=90, facecolor=chart_bg)
+        ax4 = fig4.add_subplot(111)
+        ax4.set_facecolor(chart_bg)
+        if all_mentions:
+            sentiments = {"positive": 0, "negative": 0, "neutral": 0}
+            for m in all_mentions:
+                s = m.get("sentiment", "neutral").lower()
+                if s in sentiments:
+                    sentiments[s] += 1
+            labels = [k.title() for k, v in sentiments.items() if v > 0]
+            sizes = [v for v in sentiments.values() if v > 0]
+            colors_pie = ["#10a37f", "#ef4444", "#6b7280"][:len(labels)]
+            if sizes:
+                wedges, texts, autotexts = ax4.pie(
+                    sizes, labels=labels, autopct='%1.0f%%', startangle=90,
+                    colors=colors_pie, textprops={'color': chart_fg, 'fontsize': 8},
+                    pctdistance=0.75, wedgeprops=dict(width=0.4))
+                for t in autotexts:
+                    t.set_fontsize(8)
+                    t.set_color(chart_fg)
+        else:
+            ax4.text(0.5, 0.5, "No sentiment data yet", ha='center', va='center',
+                    fontsize=10, color=FG_DIM, transform=ax4.transAxes)
+        ax4.set_title("Competitor Sentiment", fontsize=10, color=chart_fg, pad=8)
+        fig4.tight_layout(pad=1.5)
+        embed_chart(self._chart_frames[3], fig4)
+
+        self.status_label.configure(text=f"Updated {now.strftime('%H:%M')}")
 
 
 def main():
