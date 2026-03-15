@@ -1,31 +1,64 @@
-# Call Notes — Live Transcriber & Note Generator
+# Call Notes — AI-Powered Sales Productivity Suite
 
-A Windows desktop application that live-transcribes any call (Microsoft Teams, Zoom, or any platform) and generates comprehensive, organized notes using Claude on Amazon Bedrock. Notes are saved as `.docx` files organized by customer.
+A Windows desktop application for customer-facing professionals that live-transcribes calls, generates structured notes, drafts follow-up emails directly into Outlook, and provides AI-powered research and retrieval across all your historical call notes.
+
+Built on AWS services: Amazon Transcribe, Amazon Bedrock (Claude), and DynamoDB.
 
 ---
 
-## How It Works
+## Features
 
-1. **Audio Capture** — Uses [VB-CABLE](https://vb-audio.com/Cable/) to route system audio (the other person's voice) and your microphone into the app simultaneously.
-2. **Live Transcription** — Streams audio to [Amazon Transcribe Streaming](https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html) for real-time speech-to-text. Partial results appear as words are spoken; final results lock in as sentences complete.
-3. **Note Generation** — Sends the full transcript to Claude (Sonnet 4.6) on Amazon Bedrock, which produces comprehensive, structured notes covering discussion points, decisions, action items, and more.
-4. **AI Q&A Agent** — Detects AWS-related questions during the call and automatically answers them using a Strands Agent with MCP tool integration that searches live AWS documentation. Can run locally or deployed to Amazon Bedrock AgentCore Runtime.
-5. **Storage** — Saves notes as formatted `.docx` files to a customer-specific folder.
+### Tab 1: Live Transcription
+- Real-time transcription of both sides of any call (Teams, Zoom, etc.) using Amazon Transcribe with speaker diarization
+- AI-generated comprehensive meeting notes via Claude on Bedrock (streamed in real-time)
+- AI-generated follow-up email draft (runs in parallel with notes)
+- One-click Outlook draft creation with your signature preserved
+- Personalized email tone using your writing style guide
+- Copy transcript to clipboard
+- Export notes as DOCX or PDF
+- Auto-detect and answer AWS-related questions during calls via AI agent
+- Session history stored in DynamoDB with full transcript, notes, and email
+
+### Tab 2: Notes Retrieval
+- Multi-turn chat interface to query across all your historical call notes
+- Indexes notes from multiple directories (your notes + teammate folders)
+- Searchable customer filter with type-to-search popup
+- Source filter (All Sources, My Notes, teammate folders)
+- Suggested prompts for common queries
+- Session history with save/restore/delete
+- Powered by Claude Opus 4.6 with file reading tool-use
+
+### Tab 3: Customer Research
+- Web-powered research chat for any customer or topic
+- Customer Brief Generator — enter a company name and domain to produce a formatted DOCX brief with:
+  - Company overview, key facts, financial snapshot
+  - Leadership team bios
+  - Technology & AI/ML landscape analysis
+  - Tiered AWS customer references (Tier 1: highly relevant, Tier 2: adjacent)
+  - AWS solutions alignment table
+  - Discovery questions organized by theme
+  - Recommended meeting agenda
+- Briefs saved to the same customer folder as call notes
+- Session history with save/restore/delete
 
 ---
 
 ## Prerequisites
 
 - **Python 3.10+** (tested with 3.12)
-- **AWS Account** with the following enabled:
+- **Windows** (required for VB-CABLE audio routing and Outlook integration)
+- **AWS Account** with:
   - Amazon Transcribe (streaming access)
-  - Amazon Bedrock with Claude Sonnet model access
+  - Amazon Bedrock with Claude model access (Sonnet 4.6 and Opus 4.6)
+  - DynamoDB (for session history — tables auto-created on first run)
 - **AWS CLI** configured with valid credentials (`aws configure`)
-- **VB-CABLE** virtual audio driver installed ([download here](https://vb-audio.com/Cable/))
-- **IAM Permissions** — your AWS user/role needs:
+- **VB-CABLE** virtual audio driver ([download](https://vb-audio.com/Cable/))
+- **Microsoft Outlook** (desktop app, for email draft feature)
+- **IAM Permissions**:
   - `transcribe:StartStreamTranscription`
-  - `bedrock:InvokeModel`
-  - `bedrock-agentcore:*` (if using AgentCore Runtime for the Q&A agent)
+  - `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`
+  - `dynamodb:PutItem`, `dynamodb:Query`, `dynamodb:Scan`, `dynamodb:DeleteItem`, `dynamodb:CreateTable`, `dynamodb:DescribeTable`
+  - `bedrock-agentcore:*` (optional, only if deploying the AI Q&A agent)
 
 ---
 
@@ -33,20 +66,23 @@ A Windows desktop application that live-transcribes any call (Microsoft Teams, Z
 
 ```bash
 cd call_notes_app
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### Dependencies
+### Key Dependencies
 
 | Package | Purpose |
 |---|---|
 | `sounddevice` | Audio capture from mic and virtual cable |
 | `numpy` | Audio buffer mixing and PCM conversion |
 | `amazon-transcribe` | Amazon Transcribe Streaming SDK |
-| `boto3` | AWS SDK for Bedrock API calls |
-| `python-docx` | Generating formatted .docx note files |
-| `bedrock-agentcore` | AgentCore Runtime SDK for deployed agent communication |
-| `websocket-client` | WebSocket connection to AgentCore Runtime |
+| `boto3` | AWS SDK for Bedrock and DynamoDB |
+| `python-docx` | Generating formatted .docx files (notes + briefs) |
+| `customtkinter` | Modern dark-themed UI framework |
+| `pywin32` | Outlook COM integration for email drafts |
+| `fpdf2` | PDF export (optional) |
+| `bedrock-agentcore` | AgentCore Runtime SDK (optional) |
+| `strands-agents`, `mcp` | Local AI agent with MCP tools (optional) |
 
 ---
 
@@ -60,36 +96,33 @@ aws configure
 
 Enter your Access Key ID, Secret Access Key, region (`us-east-1`), and output format (`json`).
 
-Verify with:
-
-```bash
-aws sts get-caller-identity
-```
-
 ### 2. Verify Bedrock Model Access
 
 1. Go to the [Bedrock console](https://console.aws.amazon.com/bedrock/)
-2. Select your region (default: `us-east-1`)
-3. Navigate to **Model access** in the left sidebar
-4. Verify that **Anthropic Claude** models show as available
+2. Navigate to **Model access** → verify **Anthropic Claude** models are available
+
+### 3. DynamoDB Tables
+
+Two tables are used for session history. They are auto-created on first run:
+
+| Table | Purpose | Keys |
+|---|---|---|
+| `CallNotesHistory` | Stores transcripts, notes, and emails from Tab 1 | `customer_name` (PK), `timestamp` (SK) |
+| `ChatSessionHistory` | Stores chat sessions from Tabs 2 and 3 | `session_type` (PK), `timestamp` (SK) |
+
+Both tables use 60-90 day TTL for automatic cleanup.
 
 ---
 
 ## Audio Setup
 
-The app requires VB-CABLE to capture system audio from calls. See **[AUDIO_SETUP_GUIDE.md](AUDIO_SETUP_GUIDE.md)** for detailed instructions on:
+See **[AUDIO_SETUP_GUIDE.md](AUDIO_SETUP_GUIDE.md)** for detailed instructions.
 
-- Setting up VB-CABLE for headset use
-- Setting up VB-CABLE for laptop speakers
-- Switching between devices
-- Troubleshooting audio issues
-
-### Quick Setup
-
+**Quick version:**
 1. Install VB-CABLE (run installer as admin, reboot)
-2. Set Windows output device to `CABLE Input (VB-Audio Virtual Cable)`
-3. Set up listen-through via `mmsys.cpl` so you can still hear audio
-4. In the app, select `CABLE Output` for system audio and your mic for microphone
+2. Set Windows output to `CABLE Input (VB-Audio Virtual Cable)`
+3. Set up listen-through via `mmsys.cpl` → Recording → CABLE Output → Listen tab
+4. In the app: System Audio = `CABLE Output`, Microphone = your mic
 
 ---
 
@@ -100,69 +133,114 @@ cd call_notes_app
 python app.py
 ```
 
-### Usage
+The app opens with three tabs: Live Transcription, Notes Retrieval, and Customer Research.
+
+---
+
+## Tab 1: Live Transcription — Detailed Usage
 
 1. Enter the customer name
-2. Select your audio devices:
-   - **System Audio**: `CABLE Output (VB-Audio Virtual Cable)` — captures call audio
-   - **Microphone**: Your headset mic or built-in mic — captures your voice
-3. Click **Start Recording** before or during your call
-4. Watch the live transcript appear in real-time
-5. Click **Stop & Generate Notes** when the call ends
-6. Notes are generated by Claude and saved as a `.docx` file
+2. Select audio devices (System Audio = CABLE Output, Microphone = your mic)
+3. Click **Start Recording** — live transcript streams in real-time
+4. Click **Stop & Generate** — two things happen in parallel:
+   - Claude generates comprehensive structured notes
+   - Claude generates a follow-up email draft
+5. Click **📨 Outlook Draft** to create the email in your Outlook Drafts folder (with your signature)
+6. Click **📋 Copy Transcript** to copy the raw transcript
+7. Click **📄 Export DOCX** or **📑 Export PDF** to save notes
+8. All sessions are saved to DynamoDB and appear in the History sidebar
+
+### Follow-Up Email
+
+The email generator produces a clean, professional follow-up with:
+- Subject line auto-populated
+- Section headers bolded
+- Bullet-formatted action items
+- Aptos font matching Outlook defaults
+- Your Outlook signature preserved
+
+### Email Style Guide
+
+To personalize the email tone to match your writing style:
+
+```bash
+python build_style_guide.py
+```
+
+This reads your last 50 sent Outlook emails, analyzes your writing patterns with Claude, and saves `style_guide.txt`. The email generator automatically loads this file to match your greeting style, tone, vocabulary, and sign-off.
+
+### Notes Structure
+
+Claude generates notes with these sections:
+- Meeting Context
+- Detailed Discussion Notes (chronological, by topic)
+- Decisions & Agreements
+- Action Items & Owners
+- Open Questions & Unresolved Items
+- Follow-Up & Next Steps
+- Key Quotes & Verbatim Notes
+- Additional Context
 
 ---
 
-## File Output
+## Tab 2: Notes Retrieval — Detailed Usage
 
-Notes are saved to:
+A multi-turn chat interface for querying your historical call notes.
 
-```
-<your NOTES_BASE_DIR path>\
-  └── {Customer Name}\
-      ├── {Customer Name}_notes_1_2026-03-09_14-30.md
-      ├── {Customer Name}_notes_2_2026-03-15_10-00.md
-      └── ...
-```
-
-The default path is set in `config.py` — see the Configuration section below to set your own.
-
-- A new folder is created per customer if one doesn't exist
-- Files are numbered sequentially and timestamped
-- Notes are formatted `.docx` with headings, bullet lists, and bold/italic text
+1. The app indexes all `.md` and `.docx` files from your configured note directories
+2. Use the **Source** dropdown to filter by note source (your notes, teammate folders)
+3. Use the **Customer** button to open a searchable picker and filter by customer
+4. Type a question or click a suggested prompt
+5. Claude reads the relevant note files and synthesizes an answer
+6. Conversations are multi-turn — ask follow-ups in the same session
+7. Sessions auto-save to DynamoDB and can be restored from the History sidebar
 
 ---
 
-## Note Structure
+## Tab 3: Customer Research — Detailed Usage
 
-Claude generates comprehensive notes with the following sections:
+### Research Chat
+- Ask any question about a customer, industry, or topic
+- Powered by Claude with web search capabilities
+- Multi-turn conversations with session history
 
-- **Meeting Context** — participants, purpose, background
-- **Detailed Discussion Notes** — chronological, organized by topic
-- **Decisions & Agreements** — with reasoning
-- **Action Items & Owners** — numbered with deadlines
-- **Open Questions & Unresolved Items**
-- **Follow-Up & Next Steps**
-- **Key Quotes & Verbatim Notes**
-- **Additional Context** — references, tools, systems mentioned
+### Customer Brief Generator
+The right-side panel lets you generate a formatted DOCX business brief:
+
+1. Enter the company name and domain
+2. Click **Create Customer Brief**
+3. Claude researches the company across 7 dimensions:
+   - Company profile, financials, leadership
+   - Technology landscape, AI/ML use cases
+   - AWS customer references (tiered), solutions alignment
+   - Competitive context
+4. A formatted DOCX is generated with:
+   - Title page with confidentiality notice
+   - Table of contents
+   - Key facts and financial snapshot tables
+   - Leadership bios
+   - Tiered AWS customer references
+   - Discovery questions (5 themes, 4-5 questions each)
+   - Recommended meeting agenda
+5. Saved to `{NOTES_BASE_DIR}/{Company Name}/{Company}_brief_{timestamp}.docx`
 
 ---
 
 ## Configuration
 
-All settings are in `config.py`. You must update the paths to match your machine:
+All settings are in `config.py`. Update these for your machine:
 
 | Setting | Default | Description |
 |---|---|---|
-| `AWS_REGION` | `us-east-1` | AWS region for Transcribe and Bedrock |
+| `AWS_REGION` | `us-east-1` | AWS region for all services |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (16kHz for Transcribe) |
-| `NOTES_BASE_DIR` | *(author's local path)* | **Change this** to where you want notes saved, e.g. `r"C:\Users\YourName\Documents\Call Notes"` |
-| `SANGHWA_NOTES_DIR` | *(author's local path)* | Optional: path to a teammate's notes folder for the Retrieval tab. Set to `""` if not needed |
-| `AYMAN_NOTES_DIR` | *(author's local path)* | Optional: path to another teammate's notes folder. Set to `""` if not needed |
-| `CLAUDE_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Bedrock model ID for note generation |
-| `AGENTCORE_RUNTIME_ARN` | *(author's ARN)* | Set to your own AgentCore ARN after deploying, or set to `None` for local agent mode |
-| `RETRIEVAL_AGENT_ARN` | *(author's ARN)* | Set to your own ARN, or `None` for local mode |
-| `RESEARCH_AGENT_ARN` | *(author's ARN)* | Set to your own ARN, or `None` for local mode |
+| `NOTES_BASE_DIR` | *(author's path)* | **Change this** — where notes and briefs are saved |
+| `SANGHWA_NOTES_DIR` | *(author's path)* | Optional teammate notes folder. Set to `""` if not needed |
+| `AYMAN_NOTES_DIR` | *(author's path)* | Optional teammate notes folder. Set to `""` if not needed |
+| `CLAUDE_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Bedrock model for notes and email generation |
+| `AGENTCORE_RUNTIME_ARN` | *(author's ARN)* | Set to your ARN or `None` for local agent mode |
+| `RETRIEVAL_AGENT_ARN` | *(author's ARN)* | Set to your ARN or `None` |
+| `RESEARCH_AGENT_ARN` | *(author's ARN)* | Set to your ARN or `None` |
 
 ---
 
@@ -170,30 +248,31 @@ All settings are in `config.py`. You must update the paths to match your machine
 
 ```
 call_notes_app/
-├── app.py                        # Main entry point — all tab UIs (Tkinter/CTk)
-├── config.py                     # All configurable settings (paths, model IDs, ARNs)
-├── md_render.py                  # Shared markdown-to-Tkinter renderer
-├── requirements.txt              # Python dependencies
-├── README.md                     # This file
-├── SETUP.md                      # Step-by-step setup guide
-├── AUDIO_SETUP_GUIDE.md          # Detailed audio device configuration guide
+├── app.py                        # Main entry point — all 3 tab UIs
+├── config.py                     # All configurable settings
+├── md_render.py                  # Markdown-to-Tkinter renderer
+├── build_style_guide.py          # Generates email style guide from Outlook sent mail
+├── style_guide.txt               # Auto-generated writing style (used by email generator)
+├── requirements.txt
+├── README.md / SETUP.md / AUDIO_SETUP_GUIDE.md
 │
 ├── transcription/                # Tab 1: Live Transcription
 │   ├── transcriber.py            # Audio capture + Amazon Transcribe Streaming
-│   ├── summarizer.py             # Claude on Bedrock for notes + follow-up email
-│   ├── storage.py                # Markdown-to-DOCX conversion and file saving
-│   ├── history.py                # DynamoDB session persistence for call notes
-│   ├── question_detector.py      # Detects AWS-related questions in transcript
+│   ├── summarizer.py             # Notes + follow-up email generation (Bedrock)
+│   ├── storage.py                # DOCX conversion and file saving
+│   ├── history.py                # DynamoDB session persistence (CallNotesHistory)
+│   ├── question_detector.py      # AWS question detection in transcript
 │   └── agent_client.py           # AI Q&A agent (AgentCore / local MCP / Bedrock)
 │
-├── retrieval/                    # Tab 2: Notes Retrieval & Tab 3: Customer Research
-│   ├── notes_retriever.py        # Historical notes indexing and retrieval agent
-│   └── chat_history.py           # DynamoDB chat session persistence
+├── retrieval/                    # Tabs 2 & 3: Notes Retrieval + Customer Research
+│   ├── notes_retriever.py        # Note indexing, retrieval agent, research agent
+│   ├── chat_history.py           # DynamoDB chat session persistence (ChatSessionHistory)
+│   └── customer_brief.py         # Customer brief generator (research + DOCX builder)
 │
 └── agentcore_agent/              # Deployable AgentCore agents
-    ├── agent.py                  # Strands Agent with MCP tools for AWS doc search
-    ├── requirements.txt          # Agent-specific dependencies
-    ├── README.md                 # Agent deployment guide
+    ├── agent.py                  # Strands Agent with MCP tools
+    ├── requirements.txt
+    ├── README.md
     ├── research_agent/           # Customer research agent
     └── retrieval_agent/          # Notes retrieval agent
 ```
@@ -202,33 +281,15 @@ call_notes_app/
 
 ## AI Q&A Agent
 
-The app includes an AI agent that detects AWS-related questions during calls and automatically answers them by searching live AWS documentation.
-
-### How It Works
-
-When someone asks a question like "What is Amazon Bedrock?" during a call, the question detector picks it up and routes it to the agent. The agent uses MCP tool integration to search and read actual AWS docs before answering.
+Detects AWS-related questions during calls and answers them by searching live AWS documentation.
 
 ### Three Modes (automatic fallback)
 
-1. **AgentCore Runtime** — If `AGENTCORE_RUNTIME_ARN` is set in `agent_client.py`, connects to the deployed agent via WebSocket with SigV4 auth
-2. **Local MCP** — If `strands-agents` and `mcp` are installed, runs the agent in-process with MCP doc search tools
-3. **Direct Bedrock** — Falls back to a simple Claude call without doc search tools
+1. **AgentCore Runtime** — deployed agent via WebSocket + SigV4 auth
+2. **Local MCP** — in-process agent with MCP doc search tools
+3. **Direct Bedrock** — simple Claude call without tools
 
-### Deploying the Agent
-
-See [`agentcore_agent/README.md`](agentcore_agent/README.md) for full deployment instructions. Quick version:
-
-```bash
-pip install bedrock-agentcore-starter-toolkit
-cd call_notes_app/agentcore_agent
-agentcore configure --entrypoint agent.py --non-interactive --region us-east-1
-agentcore launch
-```
-
-Then set the ARN in `agent_client.py`:
-```python
-AGENTCORE_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:ACCOUNT_ID:runtime/AGENT_ID"
-```
+See [`agentcore_agent/README.md`](agentcore_agent/README.md) for deployment instructions.
 
 ---
 
@@ -236,9 +297,12 @@ AGENTCORE_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:ACCOUNT_ID:runtime/
 
 | Issue | Solution |
 |---|---|
-| `ModuleNotFoundError` | Run `python -m pip install -r requirements.txt` (use `python -m pip` to ensure correct Python) |
-| No transcript appearing | Check Windows output is set to CABLE Input; verify audio device selection in app |
-| Transcript only shows when audio pauses | This was fixed — make sure you're running the latest version of `transcriber.py` |
-| Bedrock `AccessDeniedException` | Verify Claude models are available in Bedrock console and check IAM permissions |
+| `ModuleNotFoundError` | Run `python -m pip install -r requirements.txt` |
+| No transcript appearing | Check Windows output is set to CABLE Input; verify device selection |
+| Bedrock `AccessDeniedException` | Verify Claude models in Bedrock console; check IAM permissions |
 | Transcribe `InvalidClientTokenId` | Re-run `aws configure` with valid credentials |
-| App doesn't capture mic audio | Select the correct mic in the Microphone dropdown; both streams are mixed together |
+| Outlook draft fails | Ensure Outlook desktop app is running; install `pywin32` |
+| DynamoDB `ResourceNotFoundException` | Tables auto-create on first run; ensure DynamoDB permissions |
+| Customer brief stuck on "Researching" | Normal — Claude research takes 30-60s; watch the animated progress |
+| Style guide empty | Run `python build_style_guide.py` with Outlook open and sent emails available |
+| App doesn't capture mic audio | Select correct mic in dropdown; both streams are mixed |

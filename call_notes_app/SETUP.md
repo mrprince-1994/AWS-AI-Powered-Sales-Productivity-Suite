@@ -94,6 +94,7 @@ You need an AWS account with access to Amazon Transcribe and Amazon Bedrock.
 4. Attach these managed policies:
    - `AmazonTranscribeFullAccess`
    - `AmazonBedrockFullAccess`
+   - `AmazonDynamoDBFullAccess`
    - `AmazonBedrockAgentCoreFullAccess` (only needed if deploying the AI Q&A agent to AgentCore Runtime)
 5. Go to the user → **Security credentials** tab → **Create access key**
 6. Select **"Local code"** as the use case
@@ -376,3 +377,93 @@ See [`agentcore_agent/README.md`](agentcore_agent/README.md) for more details on
 | Agent answers say "answering from general knowledge" | MCP servers failed to start — check that `uv` is installed (`pip install uv`) |
 | `agentcore invoke` quoting errors on Windows | Use no spaces in JSON: `agentcore invoke '{"prompt":"hello"}'` or assign to a PowerShell variable first |
 | AgentCore `AccessDeniedException` | Attach `AmazonBedrockAgentCoreFullAccess` policy to your IAM user (Step 6) |
+| Outlook draft fails | Ensure Outlook desktop app is running; verify `pywin32` with `python -c "import win32com.client"` |
+| DynamoDB `ResourceNotFoundException` | Tables auto-create on first run; ensure DynamoDB permissions (Step 17) |
+| Customer brief stuck on "Researching" | Normal — Claude research takes 30-60s; watch the animated progress indicator |
+| Style guide empty or missing | Run `python build_style_guide.py` with Outlook open (Step 15) |
+| Email doesn't match my style | Re-run `python build_style_guide.py` to regenerate `style_guide.txt` |
+
+---
+
+## Step 15: Set Up the Email Style Guide (Optional)
+
+The app can personalize follow-up emails to match your writing style. To set this up:
+
+1. Make sure Outlook is open with sent emails in your Sent Items folder
+2. Run the style guide generator:
+
+```bash
+cd call_notes_app
+python build_style_guide.py
+```
+
+3. This reads your last 50 sent emails, analyzes your writing patterns with Claude, and saves `style_guide.txt`
+4. The email generator automatically loads this file — no further configuration needed
+5. Re-run anytime to update as your style evolves
+
+---
+
+## Step 16: Verify Outlook Integration (Optional)
+
+The app can create follow-up email drafts directly in your Outlook Drafts folder.
+
+1. Make sure the Outlook desktop app is installed and running
+2. Verify `pywin32` is installed (included in `requirements.txt`):
+
+```bash
+python -c "import win32com.client; print('pywin32 OK')"
+```
+
+3. After generating notes from a call, click **📨 Outlook Draft** — the email will appear in your Drafts with your signature
+
+**Note:** This uses the Outlook COM interface and only works with the desktop Outlook app (not Outlook web).
+
+---
+
+## Step 17: Verify DynamoDB Access
+
+The app uses two DynamoDB tables for session history. They are auto-created on first run.
+
+1. Verify your IAM user has DynamoDB permissions (see Step 6 — `AmazonDynamoDBFullAccess` or the specific permissions listed in the README)
+2. The tables created are:
+   - `CallNotesHistory` — stores transcripts, notes, and emails from the Live Transcription tab
+   - `ChatSessionHistory` — stores chat sessions from the Notes Retrieval and Customer Research tabs
+3. Both tables have TTL enabled for automatic cleanup (60-90 days)
+
+If you see `ResourceNotFoundException` errors, the tables may not have finished creating. Wait a few seconds and try again.
+
+---
+
+## Step 18: Generate a Customer Brief (Optional)
+
+The Customer Research tab includes a brief generator that produces formatted DOCX business briefs.
+
+1. Go to the **Customer Research** tab
+2. In the right-side panel, enter a company name and domain
+3. Click **Create Customer Brief**
+4. Wait 30-60 seconds (animated progress shows research steps)
+5. The brief is saved to `{NOTES_BASE_DIR}/{Company Name}/{Company}_brief_{timestamp}.docx`
+
+The brief includes: company overview, financial snapshot, leadership bios, technology landscape, AI/ML use cases, tiered AWS customer references, solutions alignment, discovery questions, and a recommended meeting agenda.
+
+---
+
+## Quick Reference: All Features by Tab
+
+| Tab | Feature | Description |
+|---|---|---|
+| Live Transcription | Real-time transcript | Both sides of the call via VB-CABLE + mic |
+| Live Transcription | AI notes generation | Comprehensive structured notes via Claude |
+| Live Transcription | Follow-up email | Parallel email generation with style matching |
+| Live Transcription | Outlook draft | One-click email creation in Outlook Drafts |
+| Live Transcription | Copy transcript | Copy raw transcript to clipboard |
+| Live Transcription | Export DOCX/PDF | Save notes in document format |
+| Live Transcription | AI Q&A | Auto-detect and answer AWS questions during calls |
+| Live Transcription | Session history | All sessions saved to DynamoDB |
+| Notes Retrieval | Multi-turn chat | Query across all historical call notes |
+| Notes Retrieval | Multi-source indexing | Your notes + teammate folders |
+| Notes Retrieval | Customer filter | Searchable type-to-filter popup |
+| Notes Retrieval | Session history | Save/restore/delete chat sessions |
+| Customer Research | Research chat | Web-powered customer research via Claude |
+| Customer Research | Customer brief | Formatted DOCX business brief generator |
+| Customer Research | Session history | Save/restore/delete research sessions |
