@@ -467,3 +467,33 @@ The brief includes: company overview, financial snapshot, leadership bios, techn
 | Customer Research | Research chat | Web-powered customer research via Claude |
 | Customer Research | Customer brief | Formatted DOCX business brief generator |
 | Customer Research | Session history | Save/restore/delete research sessions |
+| Insights | Call Analytics | Session counts, top customers, weekly/monthly breakdowns |
+| Insights | Competitive Intel | Competitor frequency, recent mentions with sentiment |
+| Automated | Pre-Call Prep | One-click brief from customer history before calls |
+| Automated | Follow-Up Reminders | Auto-creates Outlook To Do tasks from action items |
+| Automated | Competitive Extraction | Auto-detects competitor mentions in notes |
+| Automated | Weekly Digest | Monday 8 AM email summary of past week's calls |
+| Automated | Email Style Guide | Personalizes follow-up emails to your writing style |
+
+---
+
+## Step 19: Backfill Competitive Intel (Optional)
+
+If you have existing call notes in DynamoDB, you can populate the Insights tab with historical competitor data:
+
+```bash
+cd call_notes_app
+python backfill_insights.py
+```
+
+This scans all existing sessions, extracts competitor mentions using Claude, and stores them in the `CompetitiveIntel` DynamoDB table. Run once after initial setup.
+
+---
+
+## Step 20: Verify Insights Tab
+
+1. Open the app and go to the **Insights** tab
+2. The left panel shows Call Analytics (session counts, top customers)
+3. The right panel shows Competitive Intelligence (competitor frequency, recent mentions)
+4. Click **⟳ Refresh** to update
+5. Data populates automatically as you record more calls

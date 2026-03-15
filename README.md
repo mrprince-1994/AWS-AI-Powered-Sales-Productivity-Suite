@@ -41,6 +41,19 @@ Built on AWS services: Amazon Transcribe, Amazon Bedrock (Claude), and DynamoDB.
 - Briefs saved to the same customer folder as call notes
 - Session history with save/restore/delete
 
+### Tab 4: Insights
+- Call Analytics: total sessions, this week/month counts, top customers with visual bar charts
+- Competitive Intelligence: auto-extracted competitor mentions with frequency ranking and sentiment
+- Recent competitor mentions with customer context
+- Refresh button to update on demand
+
+### Automated Features (run in background after each call)
+- Pre-Call Prep: click "📋 Pre-Call Prep" before a call to get a brief from DynamoDB history + local note files
+- Smart Follow-Up Reminders: auto-creates Outlook To Do tasks from action items with due dates and priorities
+- Competitive Intel Extraction: auto-detects competitor mentions and stores in DynamoDB
+- Weekly Digest: sends a summary email every Monday at 8 AM via Windows Task Scheduler
+- Email Style Guide: analyzes your sent emails to personalize follow-up tone
+
 ---
 
 ## Prerequisites
@@ -109,6 +122,7 @@ Two tables are used for session history. They are auto-created on first run:
 |---|---|---|
 | `CallNotesHistory` | Stores transcripts, notes, and emails from Tab 1 | `customer_name` (PK), `timestamp` (SK) |
 | `ChatSessionHistory` | Stores chat sessions from Tabs 2 and 3 | `session_type` (PK), `timestamp` (SK) |
+| `CompetitiveIntel` | Stores competitor mentions extracted from notes | `competitor` (PK), `timestamp` (SK) |
 
 Both tables use 60-90 day TTL for automatic cleanup.
 
@@ -226,6 +240,69 @@ The right-side panel lets you generate a formatted DOCX business brief:
 
 ---
 
+## Tab 4: Insights — Detailed Usage
+
+A dashboard combining call analytics and competitive intelligence.
+
+### Call Analytics (left panel)
+- Total session count, this week, this month
+- Unique customer count
+- This week's calls listed
+- Top customers ranked by call frequency with visual bar charts
+- Monthly unique customer breakdown
+
+### Competitive Intelligence (right panel)
+- Competitor frequency ranking (how often each competitor is mentioned across all calls)
+- Recent mentions with customer context and sentiment (👍 positive, 👎 negative, ➖ neutral)
+- Auto-populated from notes — no manual entry needed
+
+Click "⟳ Refresh" to update both panels.
+
+### Backfilling Historical Data
+
+To populate competitive intel from existing call notes:
+
+```bash
+python backfill_insights.py
+```
+
+This scans all DynamoDB sessions and extracts competitor mentions from each.
+
+---
+
+## Automated Features
+
+### Pre-Call Prep
+1. Enter a customer name on the Live Transcription tab
+2. Click "📋 Pre-Call Prep" (right side of button row)
+3. Pulls last 3 DynamoDB sessions + local note files for that customer
+4. Claude generates: last meeting recap, outstanding action items, open questions, promises made, suggested talking points
+5. Streams into the AI Answers panel
+
+### Smart Follow-Up Reminders
+After every "Stop & Generate", the app automatically:
+1. Extracts action items from the notes (task, owner, deadline, priority)
+2. Creates Outlook To Do tasks with due dates and reminders
+3. Tasks appear in your To Do list under "Tasks" with "Call Notes" category
+4. Reminders set 1 day before due date
+
+### Weekly Digest
+- Runs automatically every Monday at 8 AM via Windows Task Scheduler
+- Scans all calls from the past 7 days
+- Generates a summary: calls made, key decisions, open action items, follow-ups due
+- Sends directly to your email
+- Fallback: saves to `{NOTES_BASE_DIR}/_Weekly Digests/` if Outlook is unavailable
+- Run manually anytime: `python weekly_digest.py`
+
+### Competitive Intel Extraction
+After every "Stop & Generate", the app automatically:
+1. Sends notes to Claude to identify competitor mentions
+2. Extracts company name, context, and sentiment
+3. Stores in DynamoDB `CompetitiveIntel` table
+4. Visible in the Insights tab
+
+---
+
 ## Configuration
 
 All settings are in `config.py`. Update these for your machine:
@@ -252,17 +329,21 @@ call_notes_app/
 ├── config.py                     # All configurable settings
 ├── md_render.py                  # Markdown-to-Tkinter renderer
 ├── build_style_guide.py          # Generates email style guide from Outlook sent mail
+├── weekly_digest.py              # Weekly summary email (runs via Task Scheduler)
+├── backfill_insights.py          # One-time backfill of competitive intel from history
 ├── style_guide.txt               # Auto-generated writing style (used by email generator)
 ├── requirements.txt
 ├── README.md / SETUP.md / AUDIO_SETUP_GUIDE.md
 │
 ├── transcription/                # Tab 1: Live Transcription
 │   ├── transcriber.py            # Audio capture + Amazon Transcribe Streaming
-│   ├── summarizer.py             # Notes + follow-up email generation (Bedrock)
+│   ├── summarizer.py             # Notes + follow-up email + competitor/action extraction
 │   ├── storage.py                # DOCX conversion and file saving
 │   ├── history.py                # DynamoDB session persistence (CallNotesHistory)
 │   ├── question_detector.py      # AWS question detection in transcript
-│   └── agent_client.py           # AI Q&A agent (AgentCore / local MCP / Bedrock)
+│   ├── agent_client.py           # AI Q&A agent (AgentCore / local MCP / Bedrock)
+│   ├── competitive_intel.py      # DynamoDB competitive intelligence tracker
+│   └── outlook_tasks.py          # Outlook To Do task creation from action items
 │
 ├── retrieval/                    # Tabs 2 & 3: Notes Retrieval + Customer Research
 │   ├── notes_retriever.py        # Note indexing, retrieval agent, research agent
@@ -306,3 +387,6 @@ See [`agentcore_agent/README.md`](agentcore_agent/README.md) for deployment inst
 | Customer brief stuck on "Researching" | Normal — Claude research takes 30-60s; watch the animated progress |
 | Style guide empty | Run `python build_style_guide.py` with Outlook open and sent emails available |
 | App doesn't capture mic audio | Select correct mic in dropdown; both streams are mixed |
+| Outlook tasks not in To Do | Tasks appear under "Tasks" list in To Do sidebar; check "Call Notes" category |
+| Weekly digest not sending | Verify Task Scheduler task "CallNotes-WeeklyDigest" is enabled; Outlook must be running |
+| No competitors in Insights | Run `python backfill_insights.py` to populate from historical notes |
