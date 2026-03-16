@@ -41,9 +41,10 @@ Built on AWS services: Amazon Transcribe, Amazon Bedrock (Claude), and DynamoDB.
 - Briefs saved to the same customer folder as call notes
 - Session history with save/restore/delete
 
-### Tab 4: Insights
-- Call Analytics: total sessions, this week/month counts, top customers with visual bar charts
+### Tab 4: Trends & Insights
+- Call Analytics: total sessions, this week/month counts, top customers with visual charts
 - Competitive Intelligence: auto-extracted competitor mentions with frequency ranking and sentiment
+- Trend Generation: AI-powered cross-cutting trend analysis across all your calls
 - Recent competitor mentions with customer context
 - Refresh button to update on demand
 
@@ -94,6 +95,7 @@ python -m pip install -r requirements.txt
 | `customtkinter` | Modern dark-themed UI framework |
 | `pywin32` | Outlook COM integration for email drafts |
 | `fpdf2` | PDF export (optional) |
+| `matplotlib` | Charts and graphs in the Insights tab |
 | `bedrock-agentcore` | AgentCore Runtime SDK (optional) |
 | `strands-agents`, `mcp` | Local AI agent with MCP tools (optional) |
 
@@ -240,21 +242,31 @@ The right-side panel lets you generate a formatted DOCX business brief:
 
 ---
 
-## Tab 4: Insights — Detailed Usage
+## Tab 4: Trends & Insights — Detailed Usage
 
-A dashboard combining call analytics and competitive intelligence.
+A dashboard combining call analytics, competitive intelligence, and AI-powered trend analysis.
 
-### Call Analytics (left panel)
-- Total session count, this week, this month
-- Unique customer count
-- This week's calls listed
-- Top customers ranked by call frequency with visual bar charts
-- Monthly unique customer breakdown
+### Layout
+- Left side: 2x2 chart grid (call trends, top customers, competitor frequency, sentiment)
+- Right side: Trend Generation panel (full height)
+- Top: stat cards with key metrics
 
-### Competitive Intelligence (right panel)
-- Competitor frequency ranking (how often each competitor is mentioned across all calls)
-- Recent mentions with customer context and sentiment (👍 positive, 👎 negative, ➖ neutral)
-- Auto-populated from notes — no manual entry needed
+### Call Analytics (charts, left)
+- 14-day call trend line chart
+- Top customers horizontal bar chart
+- Competitor mention frequency bar chart
+- Competitor sentiment donut chart (positive/negative/neutral)
+
+### Trend Generation (right panel)
+1. Click "Generate Trends"
+2. Scans last 30 DynamoDB sessions + 20 local note files
+3. Claude identifies 5-10 cross-cutting trends across all calls:
+   - Common customer pain points
+   - Recurring technology needs
+   - Frequently mentioned competitors
+   - Shared business priorities
+   - Emerging opportunities
+4. Results stream in real-time
 
 Click "⟳ Refresh" to update both panels.
 

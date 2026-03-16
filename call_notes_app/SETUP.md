@@ -467,8 +467,9 @@ The brief includes: company overview, financial snapshot, leadership bios, techn
 | Customer Research | Research chat | Web-powered customer research via Claude |
 | Customer Research | Customer brief | Formatted DOCX business brief generator |
 | Customer Research | Session history | Save/restore/delete research sessions |
-| Insights | Call Analytics | Session counts, top customers, weekly/monthly breakdowns |
+| Insights | Call Analytics | Session counts, top customers, weekly/monthly charts |
 | Insights | Competitive Intel | Competitor frequency, recent mentions with sentiment |
+| Insights | Trend Generation | AI-powered cross-cutting trend analysis across all calls |
 | Automated | Pre-Call Prep | One-click brief from customer history before calls |
 | Automated | Follow-Up Reminders | Auto-creates Outlook To Do tasks from action items |
 | Automated | Competitive Extraction | Auto-detects competitor mentions in notes |
@@ -490,10 +491,11 @@ This scans all existing sessions, extracts competitor mentions using Claude, and
 
 ---
 
-## Step 20: Verify Insights Tab
+## Step 20: Verify Trends & Insights Tab
 
-1. Open the app and go to the **Insights** tab
-2. The left panel shows Call Analytics (session counts, top customers)
-3. The right panel shows Competitive Intelligence (competitor frequency, recent mentions)
-4. Click **⟳ Refresh** to update
-5. Data populates automatically as you record more calls
+1. Open the app and go to the **Trends & Insights** tab
+2. Stat cards at the top show Total Calls, This Week, This Month, Customers, Competitors
+3. Left side: 4 charts (call trends, top customers, competitor frequency, sentiment)
+4. Right side: Trend Generation panel — click **Generate Trends** to analyze patterns across all calls
+5. Click **⟳ Refresh** to update charts
+6. Data populates automatically as you record more calls
