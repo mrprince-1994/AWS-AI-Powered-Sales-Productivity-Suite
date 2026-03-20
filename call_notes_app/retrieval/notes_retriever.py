@@ -372,7 +372,7 @@ def _local_retrieval(question: str, file_index: list[dict], conversation_history
 
     WEB_SEARCH_TOOL = {
         "name": "web_search",
-        "description": "Search the web using DuckDuckGo. Use for current information, pricing, product details, competitor research, or anything not in the call notes.",
+        "description": "Search the web using DuckDuckGo. Use for: current company information, competitor research, industry news, product details, or anything not found in call notes or AWS documentation.",
         "input_schema": {
             "type": "object",
             "properties": {"query": {"type": "string", "description": "Search query"}},
@@ -382,17 +382,17 @@ def _local_retrieval(question: str, file_index: list[dict], conversation_history
 
     AWS_DOCS_TOOL = {
         "name": "aws_docs_search",
-        "description": "Search official AWS documentation. Use for AWS service details, features, best practices, limits, and technical guidance.",
+        "description": "Search official AWS documentation. Use for: AWS service details, features, best practices, architecture guidance, service limits, how-to guides, and technical specifications. This is the authoritative source for all AWS service information.",
         "input_schema": {
             "type": "object",
-            "properties": {"query": {"type": "string", "description": "AWS documentation search query"}},
+            "properties": {"query": {"type": "string", "description": "AWS documentation search query, e.g. 'Amazon Bedrock pricing tiers' or 'S3 lifecycle policies'"}},
             "required": ["query"],
         },
     }
 
     AWS_PRICING_TOOL = {
         "name": "aws_pricing_lookup",
-        "description": "Look up AWS service pricing. Use when questions involve AWS costs, pricing comparisons, or service rates.",
+        "description": "Look up real-time AWS service pricing from the Price List API. Use when the question involves AWS costs, pricing comparisons, or service rates. Common service codes: AmazonEC2, AmazonS3, AWSLambda, AmazonBedrock, AmazonSageMaker, AmazonRDS, AmazonDynamoDB, AmazonCloudFront.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -440,18 +440,23 @@ def _local_retrieval(question: str, file_index: list[dict], conversation_history
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 64000,
             "system": (
-                "You are an expert assistant that retrieves and synthesizes information "
-                "from historical customer call notes for an AWS account manager. "
-                "You also have access to web search, AWS documentation, and AWS pricing tools. "
-                "Use read_note_file to fetch call notes, web_search for current information or "
-                "competitor research, aws_docs_search for AWS service details and best practices, "
-                "and aws_pricing_lookup for AWS pricing information. "
-                "When asked for recent context on a customer, read ALL their notes and provide: "
-                "a customer overview, recent discussions (most recent first with key details), "
-                "outstanding action items with owners, recurring themes, and current status. "
-                "Always cite customer, source, filename, and date for note references. Be thorough — read all "
-                "relevant files. If asked a specific question, answer it directly. "
-                "Use web search and AWS tools when the question goes beyond what's in the notes."
+                "You are an expert assistant for an AWS account manager. You have four tools:\n\n"
+                "1. **read_note_file** — Read historical call notes. Use this for ANY question about "
+                "customer conversations, meetings, action items, follow-ups, or what was discussed.\n"
+                "2. **web_search** — Search the web via DuckDuckGo. Use for current events, competitor "
+                "research, company news, or anything not in the notes or AWS docs.\n"
+                "3. **aws_docs_search** — Search official AWS documentation. Use for ANY question about "
+                "AWS services, features, best practices, limits, architecture, or technical guidance.\n"
+                "4. **aws_pricing_lookup** — Look up AWS service pricing. Use when the question involves "
+                "AWS costs, pricing, rates, or cost comparisons.\n\n"
+                "ROUTING RULES:\n"
+                "- Questions about customers, calls, meetings, action items → read_note_file\n"
+                "- Questions about AWS services, features, how-to → aws_docs_search\n"
+                "- Questions about AWS pricing, costs → aws_pricing_lookup\n"
+                "- Questions about companies, competitors, news → web_search\n"
+                "- Complex questions may need multiple tools — use them in combination.\n\n"
+                "When reading notes: cite customer, source, filename, and date. Be thorough — read all "
+                "relevant files. When asked for customer context, read ALL their notes."
             ),
             "messages": conversation_history,
             "tools": [READ_TOOL, WEB_SEARCH_TOOL, AWS_DOCS_TOOL, AWS_PRICING_TOOL],
@@ -512,25 +517,25 @@ def _local_retrieval(question: str, file_index: list[dict], conversation_history
                     + _read(entry)
                 ) if entry else f"file_id '{fid}' not found."
                 if on_chunk and entry:
-                    on_chunk(f"📂 Reading: {entry['filename']}\n\n")
+                    on_chunk(f"📂 Reading note: {entry['customer']} — {entry['filename']}\n\n")
 
             elif tool_name == "web_search":
                 query = tool_input.get("query", "")
                 if on_chunk:
-                    on_chunk(f"🌐 Searching: {query}\n\n")
+                    on_chunk(f"🌐 Web search: {query}\n\n")
                 content = _execute_web_search(query)
 
             elif tool_name == "aws_docs_search":
                 query = tool_input.get("query", "")
                 if on_chunk:
-                    on_chunk(f"🔍 AWS Docs: {query}\n\n")
+                    on_chunk(f"🔍 AWS Knowledge: {query}\n\n")
                 content = _execute_aws_docs_search(query)
 
             elif tool_name == "aws_pricing_lookup":
                 service_code = tool_input.get("service_code", "")
                 region = tool_input.get("region", "us-east-1")
                 if on_chunk:
-                    on_chunk(f"💰 AWS Pricing: {service_code}\n\n")
+                    on_chunk(f"💰 AWS Pricing: {service_code} ({region})\n\n")
                 content = _execute_aws_pricing(service_code, region)
 
             else:

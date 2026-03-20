@@ -959,7 +959,13 @@ class NotesRetrieverTab:
         self._is_responding = False
         self._current_session_ts = None
         self._session_items = []
+        self._parent = parent
         self._build_ui(parent)
+        # Delay background work until the main loop is running
+        parent.after(100, self._start_background_init)
+
+    def _start_background_init(self):
+        """Start background threads after mainloop is running (avoids RuntimeError)."""
         threading.Thread(target=self._refresh_index, daemon=True).start()
         threading.Thread(target=self._init_history_table, daemon=True).start()
 
@@ -1031,7 +1037,7 @@ class NotesRetrieverTab:
 
         # ── Left: Session History sidebar ──────────────────────────────────
         sidebar = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=10,
-                                border_width=1, border_color=BORDER, width=220)
+                                border_width=1, border_color=BORDER, width=320)
         sidebar.grid(row=0, column=0, sticky="nsew", padx=(16, 6), pady=(0, 8))
         sidebar.grid_propagate(False)
 
@@ -1375,13 +1381,17 @@ class NotesRetrieverTab:
         """Persist the current conversation to local SQLite."""
         if not self._conversation_history:
             return
-        # Derive a title from the first user message
-        first_user = next(
-            (m["content"] for m in self._conversation_history
-             if m["role"] == "user" and isinstance(m["content"], str)),
-            "Chat session"
-        )
-        title = first_user[:80]
+        # Derive a title from the first user message (skip file index preamble)
+        first_user = ""
+        for m in self._conversation_history:
+            if m["role"] == "user" and isinstance(m["content"], str):
+                text = m["content"]
+                # The first message may contain "Available files (N):\n...\n---\n\nActual question"
+                if "---\n\n" in text:
+                    text = text.split("---\n\n", 1)[-1]
+                first_user = text.strip()
+                break
+        title = (first_user or "Chat session")[:80]
         customer = self.customer_filter_var.get()
         if customer == "(All)":
             customer = ""
@@ -1436,30 +1446,46 @@ class NotesRetrieverTab:
             pass
 
     def _refresh_index(self):
-        all_notes = scan_notes()
-        self._all_notes_cache = all_notes
+        try:
+            all_notes = scan_notes()
+            self._all_notes_cache = all_notes
 
-        # Collect all raw customer names
-        raw_names = list({n["customer"] for n in all_notes})
+            # Collect all raw customer names
+            raw_names = list({n["customer"] for n in all_notes})
 
-        # Fuzzy-deduplicate: 'Common Chain' and 'Common Chains' → one entry
-        from retrieval.notes_retriever import dedupe_customers, _is_likely_customer
-        canonical_map = dedupe_customers(raw_names)
+            # Fuzzy-deduplicate: 'Common Chain' and 'Common Chains' → one entry
+            from retrieval.notes_retriever import dedupe_customers, _is_likely_customer
+            canonical_map = dedupe_customers(raw_names)
 
-        # Store the mapping so _get_active_notes can match against canonical names
-        self._canonical_map = canonical_map
+            # Store the mapping so _get_active_notes can match against canonical names
+            self._canonical_map = canonical_map
 
-        # Unique canonical names for the dropdown — only real customer names
-        canonical_set = {}
-        for orig, canon in canonical_map.items():
-            if not _is_likely_customer(canon):
-                continue
-            key = canon.lower()
-            if key not in canonical_set:
-                canonical_set[key] = canon
-        customers = ["(All)"] + sorted(canonical_set.values(), key=str.lower)
+            # Unique canonical names for the dropdown — only real customer names
+            canonical_set = {}
+            for orig, canon in canonical_map.items():
+                if not _is_likely_customer(canon):
+                    continue
+                key = canon.lower()
+                if key not in canonical_set:
+                    canonical_set[key] = canon
+            customers = ["(All)"] + sorted(canonical_set.values(), key=str.lower)
 
-        self.customer_btn.after(0, lambda: self._update_index_ui(all_notes, customers))
+            # Schedule UI update on main thread — retry if widget not ready yet
+            def _schedule_update():
+                try:
+                    self.customer_btn.after(0, lambda: self._update_index_ui(all_notes, customers))
+                except RuntimeError:
+                    # Main thread not in main loop yet — retry after a short delay
+                    import time
+                    time.sleep(1)
+                    try:
+                        self.customer_btn.after(0, lambda: self._update_index_ui(all_notes, customers))
+                    except Exception:
+                        pass
+            _schedule_update()
+        except Exception as e:
+            import traceback
+            print(f"[refresh_index error] {e}\n{traceback.format_exc()}")
 
     def _update_index_ui(self, all_notes, customers):
         self._customer_values = customers
@@ -1539,10 +1565,10 @@ class NotesRetrieverTab:
     # ── Thinking animation ──
 
     _RETRIEVAL_STEPS = [
-        "🔍 Scanning note index...",
-        "📂 Identifying relevant files...",
-        "📖 Reading call notes...",
-        "🧠 Synthesizing findings...",
+        "🧠 Analyzing question...",
+        "🔧 Selecting tools...",
+        "📡 Querying sources...",
+        "📖 Processing results...",
         "✍️  Composing answer...",
     ]
     _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -1597,9 +1623,9 @@ class NotesRetrieverTab:
         # Capture tool-call progress lines for the thinking animation
         stripped = text.strip()
         if stripped and not self._streaming_started:
-            # e.g. "📂 Reading: filename" or "🔍 Querying..." — show in spinner
-            if any(stripped.startswith(p) for p in ("📂", "🔍", "🌐", "⏳")):
-                self._thinking_last_event = stripped[:60]
+            # Tool-specific progress lines — show in the spinner
+            if any(stripped.startswith(p) for p in ("📂", "🔍", "🌐", "⏳", "💰")):
+                self._thinking_last_event = stripped[:80]
                 return   # don't write to chat yet, just update the spinner
 
         self._stop_thinking_animation()
