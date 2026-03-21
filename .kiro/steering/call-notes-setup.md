@@ -1,5 +1,6 @@
 ---
 inclusion: manual
+description: Setup guide for the Call Notes desktop application
 ---
 
 # Call Notes App — Setup Guide for New Users

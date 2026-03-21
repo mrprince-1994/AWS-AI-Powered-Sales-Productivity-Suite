@@ -10,3 +10,14 @@ call_notes_app/agentcore_agent/test_invoke.py
 .bedrock_agentcore/
 *.db
 call_notes_app/launch_error.log
+
+# AWSentral / Outlook MCP — requires internal Amazon auth (Midway)
+.kiro/hooks/log-sentral-activity.kiro.hook
+.kiro/hooks/submit-sift-insight.kiro.hook
+.kiro/steering/aws-wsl-toolbox-mcp-servers.md
+call_notes_app/sift_queue/
+call_notes_app/.sift_queue/
+call_notes_app/activity_queue/
+call_notes_app/transcription/sift_insight.py
+call_notes_app/transcription/activity_logger.py
+call_notes_app/transcription/outlook_tasks.py

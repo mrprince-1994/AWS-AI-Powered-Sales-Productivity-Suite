@@ -9,6 +9,8 @@ from transcription.storage import save_notes, _md_to_docx
 from transcription.history import save_session, list_sessions, get_all_customers
 from transcription.competitive_intel import save_competitor_mentions
 from transcription.outlook_tasks import create_outlook_tasks
+from transcription.sift_insight import queue_sift_insight
+from transcription.activity_logger import queue_activity
 from transcription.question_detector import is_aws_aiml_question, extract_question
 from transcription.agent_client import ask_agent, warmup as warmup_agent, shutdown as shutdown_agent
 from md_render import configure_tags, MarkdownStreamer
@@ -239,6 +241,20 @@ class CallNotesApp:
             command=self._export_pdf)
         self.export_pdf_btn.pack(side=tk.LEFT)
 
+        self.sift_btn = ctk.CTkButton(
+            bf, text="📊 Queue SIFT", fg_color=BG_INPUT, hover_color=BG_CARD,
+            text_color=FG_TEXT, font=ctk.CTkFont("Segoe UI", 11), corner_radius=8,
+            height=34, border_width=1, border_color=BORDER, state=tk.DISABLED,
+            command=self._submit_sift)
+        self.sift_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.activity_btn = ctk.CTkButton(
+            bf, text="📝 Queue Activity", fg_color=BG_INPUT, hover_color=BG_CARD,
+            text_color=FG_TEXT, font=ctk.CTkFont("Segoe UI", 11), corner_radius=8,
+            height=34, border_width=1, border_color=BORDER, state=tk.DISABLED,
+            command=self._log_activity)
+        self.activity_btn.pack(side=tk.LEFT, padx=(6, 0))
+
         self.prep_btn = ctk.CTkButton(
             bf, text="📋 Pre-Call Prep", fg_color=BG_INPUT, hover_color=BG_CARD,
             text_color=ACCENT, font=ctk.CTkFont("Segoe UI", 11, "bold"), corner_radius=8,
@@ -462,6 +478,8 @@ class CallNotesApp:
         self.customer_var.set(item["customer_name"])
         self.export_docx_btn.configure(state=tk.NORMAL)
         self.export_pdf_btn.configure(state=tk.NORMAL)
+        self.sift_btn.configure(state=tk.NORMAL if self._current_notes else tk.DISABLED)
+        self.activity_btn.configure(state=tk.NORMAL if self._current_notes else tk.DISABLED)
         self.copy_transcript_btn.configure(state=tk.NORMAL if self._current_transcript else tk.DISABLED)
         self.outlook_draft_btn.configure(state=tk.NORMAL if self._current_email else tk.DISABLED)
         self.status_var.set(f"Loaded session from {item['timestamp'][:16]}")
@@ -604,6 +622,67 @@ class CallNotesApp:
         except ImportError:
             messagebox.showerror("Missing Library",
                                  "Install fpdf2: python -m pip install fpdf2")
+
+    def _submit_sift(self):
+        """Queue a SIFT insight from the currently loaded notes."""
+        if not self._current_notes:
+            messagebox.showinfo("No Notes", "Load a call from history first.")
+            return
+        customer = self.customer_var.get().strip() or "Unknown"
+        self.sift_btn.configure(state=tk.DISABLED, text="📊 Extracting...")
+        self.status_var.set("Extracting SIFT insight...")
+
+        def _run():
+            try:
+                path = queue_sift_insight(customer, self._current_notes)
+                if not path:
+                    self.root.after(0, lambda: self.status_var.set(
+                        "SIFT extraction failed — check console"))
+                    return
+
+                self.root.after(0, lambda: self.status_var.set(
+                    f"✅ SIFT insight queued for {customer}"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "SIFT Error", f"Failed to extract insight:\n{e}"))
+                self.root.after(0, lambda: self.status_var.set("SIFT error"))
+            finally:
+                self.root.after(0, lambda: self.sift_btn.configure(
+                    state=tk.NORMAL, text="📊 Queue SIFT"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _log_activity(self):
+        """Queue an SA activity log from the currently loaded notes."""
+        if not self._current_notes:
+            messagebox.showinfo("No Notes", "Load a call from history first.")
+            return
+        customer = self.customer_var.get().strip() or "Unknown"
+        self.activity_btn.configure(state=tk.DISABLED, text="📝 Extracting...")
+        self.status_var.set("Extracting activity details...")
+
+        def _run():
+            try:
+                path = queue_activity(customer, self._current_notes)
+                if not path:
+                    self.root.after(0, lambda: self.status_var.set(
+                        "Activity extraction failed — check console"))
+                    return
+
+                self.root.after(0, lambda: self.status_var.set(
+                    f"✅ Activity queued for {customer}"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Activity Error", f"Failed to extract activity:\n{e}"))
+                self.root.after(0, lambda: self.status_var.set("Activity error"))
+            finally:
+                self.root.after(0, lambda: self.activity_btn.configure(
+                    state=tk.NORMAL, text="📝 Queue Activity"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
 
     # ─────────────────────────── DEVICES ───────────────────────────
 
@@ -780,6 +859,8 @@ class CallNotesApp:
         self.root.after(0, lambda: self.status_var.set(f"Notes saved: {results['filepath']}"))
         self.root.after(0, lambda: self.export_docx_btn.configure(state=tk.NORMAL))
         self.root.after(0, lambda: self.export_pdf_btn.configure(state=tk.NORMAL))
+        self.root.after(0, lambda: self.sift_btn.configure(state=tk.NORMAL))
+        self.root.after(0, lambda: self.activity_btn.configure(state=tk.NORMAL))
         self.root.after(0, lambda: self.copy_transcript_btn.configure(state=tk.NORMAL))
         self.root.after(0, lambda: self.outlook_draft_btn.configure(
             state=tk.NORMAL if results["email"] else tk.DISABLED))
@@ -809,6 +890,14 @@ class CallNotesApp:
                             f"Notes saved + {count} Outlook task(s) created"))
             except Exception as e:
                 print(f"[outlook tasks] Error: {e}")
+
+            # Queue SA activity for AWSentral submission via Kiro hook
+            try:
+                activity_path = queue_activity(customer, results["notes"])
+                if activity_path:
+                    print(f"[activity] Activity queued for submission: {activity_path}")
+            except Exception as e:
+                print(f"[activity] Error: {e}")
 
     def _prepare_notes_for_streaming(self):
         self.notes_text.config(state=tk.NORMAL)
