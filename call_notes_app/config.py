@@ -30,3 +30,11 @@ RESEARCH_AGENT_ARN = os.environ.get(
     "RESEARCH_AGENT_ARN",
     "arn:aws:bedrock-agentcore:us-east-1:086680834992:runtime/researchagent-4i3Uyh3OJh"
 )
+
+# Meeting Assistant settings
+HAIKU_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+MEDDPICC_DEBOUNCE_SECONDS = 30
+MEDDPICC_BUFFER_MAX_LINES = 50
+MEDDPICC_INFERENCE_TIMEOUT = 30
+MEDDPICC_MAX_CONSECUTIVE_FAILURES = 3
+MEDDPICC_MAX_DEBOUNCE_SECONDS = 120  # Cap backoff so it doesn't spiral

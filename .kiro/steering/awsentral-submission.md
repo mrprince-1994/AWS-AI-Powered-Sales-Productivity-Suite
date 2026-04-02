@@ -28,8 +28,20 @@ When updating the `opportunityDetails` field on an opportunity:
 ## MEDDPICC Updates
 
 - Only populate MEDDPICC fields that are currently empty — never overwrite existing values.
+- If a field already has content, APPEND new evidence on a new line prefixed with the call date (e.g. `3/31: Customer confirmed 3x ROI target`).
 - Keep each field under 500 characters.
 - Only apply to Utility-type opportunities in standard stages (Prospect, Qualified, Technical Validation, Business Validation, Committed).
+- Field mapping from MEDDPICC element names to Salesforce API field names:
+  - Metrics → `metrics`
+  - Economic Buyer → `economicBuyer`
+  - Decision Criteria → `decisionCriteria`
+  - Decision Process → `decisionProcess`
+  - Paper Process → `paperProcess`
+  - Implicate the Pain → `implicateThePain`
+  - Champion → `champion`
+  - Competition → `competition`
+- MEDDPICC data is cumulative across calls — each call adds new evidence to build a complete picture over time.
+- MEDDPICC queue files are in `call_notes_app/meddpicc_queue/` with the format: `{"customer_name", "call_date", "coverage": {"Element": "evidence string"}, "coverage_count", "total_elements"}`.
 
 ## Tracker
 

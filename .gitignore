@@ -1,25 +1,32 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 .env
+
+# Archives
 *.zip
 
 # VB-Cable audio driver (not part of the app)
 VBCABLE_Driver_Pack45/
-VBCABLE_Driver_Pack45.zip
 
 # Build artifacts
 style_guide.txt
-call_notes_app/build_style_guide.py
 
-# SQLite database (local data)
+# SQLite database (local user data)
 *.db
 
-# Queue directories (transient files)
+# Queue directories (transient files processed by hooks)
 call_notes_app/sift_queue/
 call_notes_app/.sift_queue/
 call_notes_app/activity_queue/
 call_notes_app/prep_queue/
+call_notes_app/meddpicc_queue/
+
+# Test artifacts
+call_notes_app/.hypothesis/
+call_notes_app/.pytest_cache/
+.pytest_cache/
 
 # AgentCore deployment artifacts
 call_notes_app/agentcore_agent/payload.json
@@ -30,18 +37,52 @@ call_notes_app/agentcore_agent/test_invoke.py
 # Launch error log
 call_notes_app/launch_error.log
 
-# Opp team tracker (generated Excel, lives in OneDrive)
+# Generated files (local only)
 call_notes_app/opp_team_tracker.xlsx
 
-# AWSentral / Outlook MCP — requires internal Amazon auth (Midway)
+# AWSentral / Outlook MCP hooks — require internal Amazon auth (Midway)
 .kiro/hooks/log-sentral-activity.kiro.hook
 .kiro/hooks/submit-sift-insight.kiro.hook
+
+# Internal Amazon steering files — not portable
 .kiro/steering/aws-wsl-toolbox-mcp-servers.md
 .kiro/steering/aws-customer-meeting-prep.md
 .kiro/steering/aws-docx-business-brief.md
 .kiro/steering/aws-drawio-diagrams.md
 .kiro/steering/aws-presentation-design.md
+.kiro/steering/email-drafting-style-guide.md
+
+# Internal Amazon MCP-dependent modules
 call_notes_app/transcription/sift_insight.py
 call_notes_app/transcription/activity_logger.py
 call_notes_app/transcription/outlook_tasks.py
 call_notes_app/generate_opp_team_tracker.py
+call_notes_app/build_style_guide.py
+
+# Internal Amazon-specific hooks (multi-agent routing)
+.kiro/hooks/route-chat-specialist.kiro.hook
+.kiro/hooks/route-specialist-check.kiro.hook
+
+# Kiro specs (local development artifacts)
+.kiro/specs/
+
+# PDF/guide generators (one-off scripts)
+generate_guide.py
+generate_guide_pdf.py
+generate_pdf.py
+
+# Migration scripts (one-time use)
+call_notes_app/migrate_dynamo_to_sqlite.py
+call_notes_app/backfill_insights.py
+
+# Test files (internal debugging)
+call_notes_app/test_extract_buttons.py
+call_notes_app/test_outlook_task.py
+call_notes_app/test_meddpicc_bedrock.py
+call_notes_app/transcription/test_debug.py
+call_notes_app/transcription/test_long_input.py
+call_notes_app/transcription/test_search.py
+call_notes_app/transcription/test_meeting_assistant.py
+
+# Weekly digest (internal Amazon)
+call_notes_app/weekly_digest.py

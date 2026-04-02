@@ -4,14 +4,15 @@ from tkinter import messagebox, filedialog
 import customtkinter as ctk
 import threading
 from transcription.transcriber import LiveTranscriber
-from transcription.summarizer import generate_notes, generate_followup_email, generate_prep_summary, extract_competitors, extract_debrief
+from transcription.summarizer import generate_notes, generate_followup_email, generate_prep_summary, extract_competitors
 from transcription.storage import save_notes, _md_to_docx, export_share_html
-from transcription.history import save_session, list_sessions, get_all_customers
+from transcription.history import save_session, list_sessions, get_all_customers, get_latest_meddpicc
 from transcription.competitive_intel import save_competitor_mentions
 from transcription.outlook_tasks import create_followup_task
 from transcription.sift_insight import queue_sift_insight
 from transcription.activity_logger import queue_activity
 from transcription.agent_client import warmup as warmup_agent, shutdown as shutdown_agent
+from transcription.meeting_assistant import MeetingAssistant, MEDDPICC_ELEMENTS, MEDDPICC_ABBREVIATIONS
 from md_render import configure_tags, MarkdownStreamer
 from retrieval.notes_retriever import scan_notes, ask_notes_agent, ask_research_agent, NOTE_SOURCES, dedupe_customers
 from retrieval.chat_history import save_chat_session, list_chat_sessions, load_chat_session, delete_chat_session, _ensure_table
@@ -38,6 +39,13 @@ BORDER = "#1f2937"          # Subtle borders — slightly blue-tinted
 BORDER_ACCENT = "#10a37f40" # Semi-transparent accent for card borders
 USER_BUBBLE = "#1a1a1a"     # User message background
 ASST_BUBBLE = "#111111"     # Assistant message background
+
+# MEDDPICC element color mapping
+MEDDPICC_COLORS = {
+    "Metrics": "#10a37f", "Economic Buyer": "#f59e0b", "Decision Criteria": "#3b82f6",
+    "Decision Process": "#8b5cf6", "Paper Process": "#ec4899", "Implicate the Pain": "#ef4444",
+    "Champion": "#06b6d4", "Competition": "#f97316",
+}
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -112,17 +120,18 @@ def show_toast(parent, message, duration=3000, color=ACCENT):
 class CollapsibleSection(ctk.CTkFrame):
     """A section with a clickable header that toggles content visibility."""
 
-    def __init__(self, master, title, icon="", **kwargs):
+    def __init__(self, master, title, icon="", expanded=True, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
-        self._expanded = True
+        self._expanded = expanded
         self._title = title
         self._icon = icon
 
         self._header = ctk.CTkFrame(self, fg_color="transparent", cursor="hand2")
         self._header.pack(fill=tk.X)
 
+        arrow = "▼" if expanded else "▶"
         self._toggle_label = ctk.CTkLabel(
-            self._header, text=f"▼ {icon}  {title}",
+            self._header, text=f"{arrow} {icon}  {title}",
             font=ctk.CTkFont("Segoe UI", 11, "bold"), text_color=FG_BRIGHT,
             anchor="w", cursor="hand2")
         self._toggle_label.pack(side=tk.LEFT, padx=0)
@@ -131,7 +140,8 @@ class CollapsibleSection(ctk.CTkFrame):
         self._toggle_label.bind("<Button-1>", lambda e: self.toggle())
 
         self._content = ctk.CTkFrame(self, fg_color="transparent")
-        self._content.pack(fill=tk.BOTH, expand=True)
+        if expanded:
+            self._content.pack(fill=tk.BOTH, expand=True)
 
     @property
     def content(self):
@@ -173,6 +183,26 @@ class StyledText(tk.Text):
         self._outer.grid(**kw)
 
 
+def _make_wrapping_label(parent, text, text_color=FG_TEXT, font=None, **pack_kwargs):
+    """Create a CTkLabel that auto-wraps text to fit its parent's width on resize."""
+    if font is None:
+        font = ctk.CTkFont("Segoe UI", 12)
+    lbl = ctk.CTkLabel(parent, text=text, text_color=text_color, font=font,
+                        anchor=tk.W, wraplength=1)
+    lbl._last_wrap_width = 0
+
+    def _update_wrap(event):
+        new_width = event.width - 20
+        if new_width > 50 and abs(new_width - lbl._last_wrap_width) > 5:
+            lbl._last_wrap_width = new_width
+            lbl.configure(wraplength=new_width)
+
+    # Bind to the PARENT's configure, not the label itself — avoids feedback loop
+    parent.bind("<Configure>", lambda e: _update_wrap(e), add="+")
+    lbl.pack(anchor=tk.W, fill=tk.X, **pack_kwargs)
+    return lbl
+
+
 class CallNotesApp:
     def __init__(self, root):
         self.root = root
@@ -190,8 +220,16 @@ class CallNotesApp:
         self._current_email = ""
         self._ai_enabled = True
         self._pending_questions = set()
+        self._rendered_questions = set()  # Track question texts already shown in the coach panel
         self._generating = False
         self._locked_customer = ""
+        self.meeting_assistant = MeetingAssistant(
+            root=self.root,
+            on_suggestions=self._render_suggestions,
+            on_coverage=self._update_coverage_ui,
+            on_status=self._update_meddpicc_status,
+            on_summary=self._show_meddpicc_summary,
+        )
         self._build_ui()
         self._load_devices()
 
@@ -295,8 +333,49 @@ class CallNotesApp:
                              border_width=1, border_color=BORDER)
         card.pack(fill=tk.BOTH, expand=True)
 
+        # ── Scrollable wrapper for all center panel content ──
+        self._center_canvas = tk.Canvas(card, bg=BG_PANEL, highlightthickness=0,
+                                         borderwidth=0)
+        self._center_scrollbar = ctk.CTkScrollbar(
+            card, command=self._center_canvas.yview,
+            fg_color=BG_PANEL, button_color="#2a2a2a",
+            button_hover_color=ACCENT, width=8)
+        self._center_canvas.configure(yscrollcommand=self._center_scrollbar.set)
+
+        self._center_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 3), pady=6)
+        self._center_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._center_inner = ctk.CTkFrame(self._center_canvas, fg_color="transparent")
+        self._center_canvas_window = self._center_canvas.create_window(
+            (0, 0), window=self._center_inner, anchor="nw")
+
+        def _on_center_configure(event):
+            self._center_canvas.configure(scrollregion=self._center_canvas.bbox("all"))
+
+        def _on_canvas_resize(event):
+            self._center_canvas.itemconfig(self._center_canvas_window, width=event.width)
+
+        self._center_inner.bind("<Configure>", _on_center_configure)
+        self._center_canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Mousewheel scrolling
+        def _on_mousewheel(event):
+            self._center_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_mousewheel(event):
+            self._center_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_mousewheel(event):
+            self._center_canvas.unbind_all("<MouseWheel>")
+
+        self._center_canvas.bind("<Enter>", _bind_mousewheel)
+        self._center_canvas.bind("<Leave>", _unbind_mousewheel)
+
+        # All content goes into _center_inner instead of card
+        inner = self._center_inner
+
         # Controls grid
-        ctrl = ctk.CTkFrame(card, fg_color="transparent")
+        ctrl = ctk.CTkFrame(inner, fg_color="transparent")
         ctrl.pack(fill=tk.X, padx=16, pady=(14, 8))
 
         for i, (label, var_name, placeholder) in enumerate([
@@ -332,7 +411,7 @@ class CallNotesApp:
                 self.mic_device_combo = combo
 
         # Buttons — Row 1: Recording controls
-        row1 = ctk.CTkFrame(card, fg_color="transparent")
+        row1 = ctk.CTkFrame(inner, fg_color="transparent")
         row1.pack(fill=tk.X, padx=16, pady=(4, 4))
 
         self.start_btn = ctk.CTkButton(
@@ -361,7 +440,7 @@ class CallNotesApp:
         self.prep_btn.pack(side=tk.RIGHT)
 
         # Buttons — Row 2: Post-call actions
-        row2 = ctk.CTkFrame(card, fg_color="transparent")
+        row2 = ctk.CTkFrame(inner, fg_color="transparent")
         row2.pack(fill=tk.X, padx=16, pady=(0, 8))
 
         ctk.CTkLabel(row2, text="Post-call:", text_color=FG_DIM,
@@ -403,7 +482,7 @@ class CallNotesApp:
         self.activity_btn.pack(side=tk.LEFT)
 
         # ── Post-Call Progress Checklist ──
-        self._checklist_frame = ctk.CTkFrame(card, fg_color=BG_INPUT, corner_radius=10,
+        self._checklist_frame = ctk.CTkFrame(inner, fg_color=BG_INPUT, corner_radius=10,
                                               border_width=1, border_color=BORDER)
         # Hidden by default — shown after Stop & Generate
         self._checklist_items = {}
@@ -414,7 +493,6 @@ class CallNotesApp:
             ("save", "Save session"),
             ("competitors", "Extract competitor mentions"),
             ("outlook_task", "Create Outlook follow-up task"),
-            ("debrief", "Auto-fill post-call debrief"),
         ]
         checklist_header = ctk.CTkFrame(self._checklist_frame, fg_color="transparent")
         checklist_header.pack(fill=tk.X, padx=10, pady=(8, 4))
@@ -442,8 +520,8 @@ class CallNotesApp:
         ctk.CTkFrame(self._checklist_frame, fg_color="transparent", height=6).pack()
 
         # ── Collapsible: Transcript ──
-        self._transcript_section = CollapsibleSection(card, "Live Transcript", icon="🎙")
-        self._transcript_section.pack(fill=tk.BOTH, expand=True, padx=16, pady=(4, 4))
+        self._transcript_section = CollapsibleSection(inner, "Live Transcript", icon="🎙")
+        self._transcript_section.pack(fill=tk.X, padx=16, pady=(4, 4))
 
         transcript_header = ctk.CTkFrame(self._transcript_section.content, fg_color="transparent")
         transcript_header.pack(fill=tk.X, pady=(0, 4))
@@ -458,8 +536,8 @@ class CallNotesApp:
         self.transcript_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
         # ── Collapsible: Manual Notes ──
-        self._manual_notes_section = CollapsibleSection(card, "Manual Notes", icon="✏️")
-        self._manual_notes_section.pack(fill=tk.BOTH, padx=16, pady=(0, 4))
+        self._manual_notes_section = CollapsibleSection(inner, "Manual Notes", icon="✏️")
+        self._manual_notes_section.pack(fill=tk.X, padx=16, pady=(0, 4))
 
         manual_hint = ctk.CTkLabel(
             self._manual_notes_section.content,
@@ -469,17 +547,18 @@ class CallNotesApp:
 
         self.manual_notes_text = StyledText(
             self._manual_notes_section.content, height=4, font=("Segoe UI", 10))
+        self.manual_notes_text.configure(state=tk.NORMAL)
         self.manual_notes_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
         # ── Collapsible: Notes ──
-        self._notes_section = CollapsibleSection(card, "Generated Notes", icon="📝")
-        self._notes_section.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 4))
+        self._notes_section = CollapsibleSection(inner, "Generated Notes", icon="📝", expanded=False)
+        self._notes_section.pack(fill=tk.X, padx=16, pady=(0, 4))
         self.notes_text = StyledText(self._notes_section.content, height=8)
         self.notes_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
         # ── Collapsible: Follow-Up Email ──
-        self._email_section = CollapsibleSection(card, "Follow-Up Email", icon="📧")
-        self._email_section.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
+        self._email_section = CollapsibleSection(inner, "Follow-Up Email", icon="📧", expanded=False)
+        self._email_section.pack(fill=tk.X, padx=16, pady=(0, 14))
 
         email_header = ctk.CTkFrame(self._email_section.content, fg_color="transparent")
         email_header.pack(fill=tk.X, pady=(0, 4))
@@ -500,64 +579,86 @@ class CallNotesApp:
                              border_width=1, border_color=BORDER)
         card.pack(fill=tk.BOTH, expand=True)
 
-        # Header with clear button
-        top = ctk.CTkFrame(card, fg_color="transparent")
-        top.pack(fill=tk.X, padx=14, pady=(14, 6))
-        ctk.CTkLabel(top, text="📋  Call Intelligence",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
-                     text_color=ACCENT).pack(side=tk.LEFT)
-        ctk.CTkButton(top, text="Clear", width=60, height=28, fg_color=BG_INPUT,
+        # ── Collapsible Call Intelligence Section ──
+        self._intel_section = CollapsibleSection(card, "Call Intelligence", icon="📋", expanded=False)
+        self._intel_section.pack(fill=tk.X, padx=12, pady=(10, 4))
+
+        # Header with clear button inside the collapsible content
+        intel_top = ctk.CTkFrame(self._intel_section.content, fg_color="transparent")
+        intel_top.pack(fill=tk.X, padx=2, pady=(4, 4))
+        ctk.CTkButton(intel_top, text="Clear", width=60, height=28, fg_color=BG_INPUT,
                       hover_color=BG_CARD, text_color=ACCENT, corner_radius=6,
                       font=ctk.CTkFont("Segoe UI", 11),
                       command=self._clear_ai_answers).pack(side=tk.RIGHT)
 
-        # AI text display (used by both prep and debrief)
-        self.ai_text = StyledText(card, height=10, font=("Segoe UI", 10))
-        self.ai_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 6))
+        # AI text display (used by prep summaries)
+        self.ai_text = StyledText(self._intel_section.content, height=10, font=("Segoe UI", 10))
+        self.ai_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 4))
         configure_tags(self.ai_text)
 
-        # ── Post-Call Debrief Section ──
-        debrief_frame = ctk.CTkFrame(card, fg_color=BG_INPUT, corner_radius=12,
-                                      border_width=1, border_color=BORDER)
-        debrief_frame.pack(fill=tk.X, padx=12, pady=(4, 12))
+        # ── MEDDPICC Coach Section ──
+        self._meddpicc_section = CollapsibleSection(card, "MEDDPICC Coach", icon="🎯", expanded=True)
+        self._meddpicc_section.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
 
-        ctk.CTkLabel(debrief_frame, text="📝 Post-Call Debrief",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                     text_color=FG_BRIGHT).pack(anchor=tk.W, padx=10, pady=(8, 2))
+        # Coverage indicator row
+        coverage_frame = ctk.CTkFrame(self._meddpicc_section.content, fg_color="transparent")
+        coverage_frame.pack(fill=tk.X, padx=8, pady=(4, 4))
+        self._coverage_labels = {}
+        self._question_history_popup = None  # Track active popup
+        for abbr, element in zip(MEDDPICC_ABBREVIATIONS, MEDDPICC_ELEMENTS):
+            lbl = ctk.CTkLabel(coverage_frame, text=abbr, width=28, height=24,
+                               fg_color=BG_DARK, corner_radius=4,
+                               text_color=FG_DIM, cursor="hand2",
+                               font=ctk.CTkFont("Segoe UI", 10, "bold"))
+            lbl.pack(side=tk.LEFT, padx=2)
+            lbl.bind("<Button-1>", lambda e, el=element: self._show_question_history(el, e))
+            self._coverage_labels[element] = lbl
 
-        ctk.CTkLabel(debrief_frame, text="Auto-filled from transcript — edit before queuing SIFT",
-                     font=ctk.CTkFont("Segoe UI", 9), text_color=FG_DIM
-                     ).pack(anchor=tk.W, padx=10, pady=(0, 6))
+        # Suggestions container — scrollable, expands to fill available space
+        suggestions_outer = ctk.CTkFrame(self._meddpicc_section.content, fg_color="transparent")
+        suggestions_outer.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
-        # What went well
-        ctk.CTkLabel(debrief_frame, text="✅ What went well?", text_color=ACCENT,
-                     font=ctk.CTkFont("Segoe UI", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(4, 0))
-        self.debrief_well_var = tk.StringVar()
-        ctk.CTkEntry(debrief_frame, textvariable=self.debrief_well_var,
-                     fg_color=BG_DARK, border_color=BORDER, text_color=FG_BRIGHT,
-                     font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
-                     placeholder_text="e.g. Customer committed to POC, strong exec alignment..."
-                     ).pack(fill=tk.X, padx=10, pady=(2, 4))
+        self._suggestions_canvas = tk.Canvas(suggestions_outer, bg=BG_PANEL,
+                                              highlightthickness=0, borderwidth=0)
+        self._suggestions_scrollbar = ctk.CTkScrollbar(
+            suggestions_outer, command=self._suggestions_canvas.yview,
+            fg_color=BG_PANEL, button_color="#2a2a2a",
+            button_hover_color=ACCENT, width=6)
+        self._suggestions_canvas.configure(yscrollcommand=self._suggestions_scrollbar.set)
 
-        # What's the risk
-        ctk.CTkLabel(debrief_frame, text="⚠️ What's the risk?", text_color=ORANGE,
-                     font=ctk.CTkFont("Segoe UI", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(2, 0))
-        self.debrief_risk_var = tk.StringVar()
-        ctk.CTkEntry(debrief_frame, textvariable=self.debrief_risk_var,
-                     fg_color=BG_DARK, border_color=BORDER, text_color=FG_BRIGHT,
-                     font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
-                     placeholder_text="e.g. Budget not confirmed, competitor eval in progress..."
-                     ).pack(fill=tk.X, padx=10, pady=(2, 4))
+        self._suggestions_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=2)
+        self._suggestions_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # What's the next step
-        ctk.CTkLabel(debrief_frame, text="🎯 Highest priority next step?", text_color="#60a5fa",
-                     font=ctk.CTkFont("Segoe UI", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(2, 0))
-        self.debrief_next_var = tk.StringVar()
-        ctk.CTkEntry(debrief_frame, textvariable=self.debrief_next_var,
-                     fg_color=BG_DARK, border_color=BORDER, text_color=FG_BRIGHT,
-                     font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
-                     placeholder_text="e.g. Schedule follow-up demo, send architecture doc..."
-                     ).pack(fill=tk.X, padx=10, pady=(2, 10))
+        self._suggestions_frame = ctk.CTkFrame(self._suggestions_canvas, fg_color="transparent")
+        self._suggestions_canvas_window = self._suggestions_canvas.create_window(
+            (0, 0), window=self._suggestions_frame, anchor="nw")
+
+        def _on_suggestions_configure(event):
+            self._suggestions_canvas.configure(scrollregion=self._suggestions_canvas.bbox("all"))
+
+        def _on_suggestions_canvas_resize(event):
+            self._suggestions_canvas.itemconfig(self._suggestions_canvas_window, width=event.width)
+
+        self._suggestions_frame.bind("<Configure>", _on_suggestions_configure)
+        self._suggestions_canvas.bind("<Configure>", _on_suggestions_canvas_resize)
+
+        def _on_suggestions_mousewheel(event):
+            self._suggestions_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_suggestions_mousewheel(event):
+            self._suggestions_canvas.bind_all("<MouseWheel>", _on_suggestions_mousewheel)
+
+        def _unbind_suggestions_mousewheel(event):
+            self._suggestions_canvas.unbind_all("<MouseWheel>")
+
+        self._suggestions_canvas.bind("<Enter>", _bind_suggestions_mousewheel)
+        self._suggestions_canvas.bind("<Leave>", _unbind_suggestions_mousewheel)
+
+        # Inactive state message
+        self._meddpicc_status_label = ctk.CTkLabel(self._suggestions_frame,
+            text="Activates during live calls",
+            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 9, slant="italic"))
+        self._meddpicc_status_label.pack(pady=4)
 
     # ─────────────────────────── CALLBACKS ───────────────────────────
 
@@ -577,29 +678,286 @@ class CallNotesApp:
         self.ai_text.delete("1.0", tk.END)
         self.ai_text.config(state=tk.DISABLED)
 
+    def _update_coverage_ui(self, coverage):
+        """Update MEDDPICC coverage indicator labels."""
+        for element, covered in coverage.items():
+            lbl = self._coverage_labels.get(element)
+            if lbl:
+                if covered:
+                    lbl.configure(fg_color=ACCENT, text_color=BG_DARK)
+                else:
+                    lbl.configure(fg_color=BG_DARK, text_color=FG_DIM)
+
+    def _render_suggestions(self, suggestions):
+        """Append new suggestions to the panel without destroying existing ones.
+
+        New questions appear at the top. Addressed questions are removed.
+        Existing unanswered questions stay in place — no flashing.
+        """
+        # Remove the "listening" placeholder and status label if present
+        for widget in self._suggestions_frame.winfo_children():
+            try:
+                text = widget.cget("text") if hasattr(widget, "cget") else ""
+                if "listening" in str(text).lower() or "activates during" in str(text).lower():
+                    widget.destroy()
+            except Exception:
+                pass
+
+        # Remove cards for questions that have been addressed
+        all_questions = self.meeting_assistant.get_question_history()
+        addressed_texts = {q["question"] for q in all_questions if q.get("addressed")}
+        for widget in list(self._suggestions_frame.winfo_children()):
+            q_text = getattr(widget, "_question_text", None)
+            if q_text and q_text in addressed_texts:
+                widget.destroy()
+                self._rendered_questions.discard(q_text)
+
+        # Determine which new questions to add
+        new_questions = []
+        for s in (suggestions or []):
+            q_text = s.get("question", "")
+            if q_text and q_text not in self._rendered_questions and q_text not in addressed_texts:
+                new_questions.append(s)
+
+        # Insert new question cards at the top (before existing children)
+        # We pack them in reverse order with before= the first existing child
+        first_existing = None
+        children = self._suggestions_frame.winfo_children()
+        for child in children:
+            if isinstance(child, ctk.CTkFrame):
+                first_existing = child
+                break
+
+        for s in reversed(new_questions):
+            element = s.get("element", "")
+            question = s.get("question", "")
+            color = MEDDPICC_COLORS.get(element, BORDER)
+            row = ctk.CTkFrame(self._suggestions_frame, fg_color=BG_CARD, corner_radius=8,
+                               border_width=1, border_color=color)
+            row._question_text = question  # Tag for later removal
+            if first_existing:
+                row.pack(fill=tk.X, pady=2, before=first_existing)
+            else:
+                row.pack(fill=tk.X, pady=2)
+            first_existing = row  # Next one goes before this one
+            ctk.CTkLabel(row, text=f"[{element}]",
+                         text_color=color,
+                         font=ctk.CTkFont("Segoe UI", 11, "bold")).pack(anchor=tk.W, padx=10, pady=(6, 0))
+            _make_wrapping_label(row, question, text_color=FG_TEXT,
+                                 font=ctk.CTkFont("Segoe UI", 12),
+                                 padx=10, pady=(2, 6))
+            self._rendered_questions.add(question)
+
+        # Ensure status label exists at the bottom
+        has_status = False
+        for widget in self._suggestions_frame.winfo_children():
+            if widget is getattr(self, '_meddpicc_status_label', None):
+                has_status = True
+                break
+        if not has_status:
+            self._meddpicc_status_label = ctk.CTkLabel(self._suggestions_frame,
+                text="", text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 9, slant="italic"))
+            self._meddpicc_status_label.pack(pady=0)
+
+        # If panel is completely empty, show placeholder
+        visible_cards = [w for w in self._suggestions_frame.winfo_children()
+                         if isinstance(w, ctk.CTkFrame) and hasattr(w, '_question_text')]
+        if not visible_cards and not new_questions:
+            ctk.CTkLabel(self._suggestions_frame, text="No new suggestions — listening...",
+                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11, slant="italic")).pack(pady=4)
+
+    def _update_meddpicc_status(self, message):
+        """Update the MEDDPICC status message."""
+        if not message:
+            return
+        # Show status as a small label at the bottom of suggestions
+        # Don't clear existing suggestions on error
+        try:
+            self._meddpicc_status_label.configure(text=message)
+        except Exception:
+            pass
+
+    def _show_question_history(self, element, event=None):
+        """Show a popup with all historical questions for a MEDDPICC element."""
+        # Dismiss any existing popup
+        if self._question_history_popup is not None:
+            try:
+                self._question_history_popup.destroy()
+            except Exception:
+                pass
+            self._question_history_popup = None
+
+        questions = self.meeting_assistant.get_question_history(element)
+        color = MEDDPICC_COLORS.get(element, BORDER)
+
+        # Create popup anchored near the clicked label
+        popup = ctk.CTkToplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(fg_color=BG_PANEL)
+        self._question_history_popup = popup
+
+        # Position near the clicked label
+        if event and event.widget:
+            x = event.widget.winfo_rootx()
+            y = event.widget.winfo_rooty() + event.widget.winfo_height() + 4
+        else:
+            x = self.root.winfo_rootx() + 100
+            y = self.root.winfo_rooty() + 200
+        popup.geometry(f"+{x}+{y}")
+        popup.minsize(350, 100)
+
+        # Outer frame with border
+        outer = ctk.CTkFrame(popup, fg_color=BG_PANEL, corner_radius=10,
+                              border_width=2, border_color=color)
+        outer.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+        # Header
+        header = ctk.CTkFrame(outer, fg_color="transparent")
+        header.pack(fill=tk.X, padx=10, pady=(8, 4))
+        ctk.CTkLabel(header, text=f"📋 {element}",
+                     text_color=color,
+                     font=ctk.CTkFont("Segoe UI", 13, "bold")).pack(side=tk.LEFT)
+        ctk.CTkButton(header, text="✕", width=22, height=22,
+                      fg_color="transparent", hover_color=BG_CARD,
+                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10),
+                      corner_radius=4,
+                      command=popup.destroy).pack(side=tk.RIGHT)
+
+        # Question list
+        if not questions:
+            ctk.CTkLabel(outer, text="No questions generated yet for this element.",
+                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11, slant="italic")
+                         ).pack(padx=12, pady=(4, 10))
+        else:
+            for q in questions:
+                addressed = q.get("addressed", False)
+                q_color = ACCENT if addressed else FG_TEXT
+                icon = "✅" if addressed else "💬"
+                row = ctk.CTkFrame(outer, fg_color=BG_CARD if not addressed else "#0d2818",
+                                   corner_radius=6)
+                row.pack(fill=tk.X, padx=10, pady=2)
+                _make_wrapping_label(row, f"{icon} {q['question']}",
+                                     text_color=q_color,
+                                     font=ctk.CTkFont("Segoe UI", 11),
+                                     padx=10, pady=5)
+
+        # Summary line
+        total = len(questions)
+        addressed_count = sum(1 for q in questions if q.get("addressed"))
+        if total > 0:
+            ctk.CTkLabel(outer, text=f"{addressed_count}/{total} addressed",
+                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 9)).pack(pady=(2, 8))
+        else:
+            ctk.CTkFrame(outer, fg_color="transparent", height=4).pack()
+
+        # Auto-dismiss when clicking elsewhere
+        def _dismiss_on_focus_out(e):
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+                    self._question_history_popup = None
+            except Exception:
+                pass
+
+        popup.bind("<FocusOut>", _dismiss_on_focus_out)
+        # Also dismiss after 10 seconds as a safety net
+        popup.after(10000, lambda: _dismiss_on_focus_out(None))
+
+    def _show_meddpicc_summary(self, summary_text):
+        """Display post-call MEDDPICC summary in the suggestions area — compact format."""
+        for widget in self._suggestions_frame.winfo_children():
+            widget.destroy()
+
+        # Title
+        ctk.CTkLabel(self._suggestions_frame, text="MEDDPICC Coverage Summary",
+                     text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 12, "bold")
+                     ).pack(anchor=tk.W, pady=(4, 2))
+
+        # Compact summary: one line per element, no follow-up lines
+        for line in summary_text.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("=") or line.startswith("Coverage:") or line.startswith("MEDDPICC"):
+                continue
+            if line.startswith("↳"):
+                continue  # skip verbose follow-up lines
+            text_color = ACCENT if line.startswith("✅") else (RED if line.startswith("❌") else FG_TEXT)
+            _make_wrapping_label(self._suggestions_frame, line,
+                                 text_color=text_color,
+                                 font=ctk.CTkFont("Segoe UI", 11),
+                                 padx=4, pady=1)
+
+    def _render_historical_meddpicc(self, coverage, questions):
+        """Render MEDDPICC coverage and question history for a loaded historical session."""
+        from transcription.meeting_assistant import MEDDPICC_ELEMENTS as _ELEMENTS
+
+        # Update coverage boxes
+        for element in _ELEMENTS:
+            info = coverage.get(element, {})
+            covered = info.get("covered", False) if isinstance(info, dict) else False
+            lbl = self._coverage_labels.get(element)
+            if lbl:
+                if covered:
+                    lbl.configure(fg_color=ACCENT, text_color=BG_DARK)
+                else:
+                    lbl.configure(fg_color=BG_DARK, text_color=FG_DIM)
+
+        # Render questions in the suggestions area
+        for widget in self._suggestions_frame.winfo_children():
+            widget.destroy()
+
+        if not questions:
+            covered_count = sum(1 for e in _ELEMENTS
+                                if coverage.get(e, {}).get("covered", False))
+            ctk.CTkLabel(self._suggestions_frame,
+                         text=f"MEDDPICC: {covered_count}/8 covered · No questions recorded",
+                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(pady=4)
+            return
+
+        # Group questions by element
+        from collections import defaultdict
+        by_element = defaultdict(list)
+        for q in questions:
+            by_element[q.get("element", "Unknown")].append(q)
+
+        for element in _ELEMENTS:
+            qs = by_element.get(element, [])
+            if not qs:
+                continue
+            info = coverage.get(element, {})
+            covered = info.get("covered", False) if isinstance(info, dict) else False
+            color = MEDDPICC_COLORS.get(element, BORDER)
+
+            # Element header
+            status_icon = "✅" if covered else "❌"
+            ctk.CTkLabel(self._suggestions_frame,
+                         text=f"{status_icon} {element}",
+                         text_color=color,
+                         font=ctk.CTkFont("Segoe UI", 11, "bold")).pack(anchor=tk.W, padx=4, pady=(6, 2))
+
+            # Evidence if covered
+            if covered and isinstance(info, dict) and info.get("evidence"):
+                ctk.CTkLabel(self._suggestions_frame,
+                             text=f"   Evidence: {info['evidence']}",
+                             text_color=FG_DIM,
+                             font=ctk.CTkFont("Segoe UI", 9, slant="italic")).pack(anchor=tk.W, padx=8, pady=0)
+
+            for q in qs:
+                addressed = q.get("addressed", False)
+                q_color = ACCENT if addressed else FG_TEXT
+                icon = "✅" if addressed else "💬"
+                row = ctk.CTkFrame(self._suggestions_frame,
+                                   fg_color="#0d2818" if addressed else BG_CARD,
+                                   corner_radius=6)
+                row.pack(fill=tk.X, padx=8, pady=1)
+                _make_wrapping_label(row, f"{icon} {q['question']}",
+                                     text_color=q_color,
+                                     font=ctk.CTkFont("Segoe UI", 11),
+                                     padx=10, pady=4)
+
     def _check_transcript_for_questions(self, text):
-        pass  # Question detection removed — panel is now prep + debrief only
-
-    def _get_debrief_context(self) -> str:
-        """Collect debrief fields into a text block for SIFT enrichment."""
-        parts = []
-        well = self.debrief_well_var.get().strip()
-        risk = self.debrief_risk_var.get().strip()
-        nxt = self.debrief_next_var.get().strip()
-        if well:
-            parts.append(f"What went well: {well}")
-        if risk:
-            parts.append(f"Risk/concern: {risk}")
-        if nxt:
-            parts.append(f"Next step: {nxt}")
-        return "\n".join(parts)
-
-    def _populate_debrief(self, debrief: dict):
-        """Auto-fill the debrief fields from Claude's analysis. User can edit before SIFT."""
-        self.debrief_well_var.set(debrief.get("went_well", ""))
-        self.debrief_risk_var.set(debrief.get("risk", ""))
-        self.debrief_next_var.set(debrief.get("next_step", ""))
-        self.status_var.set("📝 Post-call debrief auto-filled — review and edit before queuing SIFT")
+        """Feed finalized transcript line to the MEDDPICC meeting assistant."""
+        self.meeting_assistant.add_line(text)
 
     # ─────────────────────────── POST-CALL CHECKLIST ──────────────────────────
 
@@ -755,6 +1113,27 @@ class CallNotesApp:
         self.copy_transcript_btn.configure(state=tk.NORMAL if self._current_transcript else tk.DISABLED)
         self.outlook_draft_btn.configure(state=tk.NORMAL if self._current_email else tk.DISABLED)
         self.status_var.set(f"Loaded session from {item['timestamp'][:16]}")
+
+        # Restore MEDDPICC state if available
+        import json as _json
+        meddpicc_raw = item.get("meddpicc_data", "")
+        if meddpicc_raw:
+            try:
+                meddpicc = _json.loads(meddpicc_raw)
+                self.meeting_assistant.load_state(meddpicc)
+                # Show the questions in the suggestions area
+                questions = meddpicc.get("questions", [])
+                coverage = meddpicc.get("coverage", {})
+                self._render_historical_meddpicc(coverage, questions)
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        else:
+            # Clear MEDDPICC display for sessions without data
+            self._update_coverage_ui({e: False for e in MEDDPICC_ELEMENTS})
+            for widget in self._suggestions_frame.winfo_children():
+                widget.destroy()
+            ctk.CTkLabel(self._suggestions_frame, text="No MEDDPICC data for this session",
+                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10, slant="italic")).pack(pady=4)
 
     # ─────────────────────────── EXPORT ───────────────────────────
 
@@ -915,13 +1294,7 @@ class CallNotesApp:
 
         def _run():
             try:
-                # Gather debrief context if provided
-                debrief = self._get_debrief_context()
-                notes_with_debrief = self._current_notes
-                if debrief:
-                    notes_with_debrief += f"\n\n--- SA DEBRIEF ---\n{debrief}"
-
-                path = queue_sift_insight(customer, notes_with_debrief)
+                path = queue_sift_insight(customer, self._current_notes)
                 if path == "DUPLICATE":
                     self.root.after(0, lambda: self.status_var.set(
                         f"⚠️ SIFT insight already queued for {customer}"))
@@ -1079,6 +1452,7 @@ class CallNotesApp:
         self._current_notes = ""
         self._current_email = ""
         self._pending_questions.clear()
+        self._rendered_questions.clear()
         self.export_docx_btn.configure(state=tk.DISABLED)
         self.export_pdf_btn.configure(state=tk.DISABLED)
         self.share_html_btn.configure(state=tk.DISABLED)
@@ -1088,7 +1462,33 @@ class CallNotesApp:
         self.transcriber = LiveTranscriber(
             system_device=system_dev, mic_device=mic_dev,
             on_partial=self._on_partial, on_final=self._on_final)
-        self.transcriber.start()
+        self.transcriber.on_status = lambda msg: self.root.after(0, self.status_var.set, msg)
+        try:
+            self.transcriber.start()
+        except Exception as e:
+            messagebox.showerror("Audio Device Error",
+                                 f"Failed to start recording:\n{e}\n\n"
+                                 "Try reselecting your audio devices or check that "
+                                 "VB-Cable / your microphone is connected.")
+            self.transcriber = None
+            self.status_var.set("Ready")
+            return
+
+        if not self.transcriber._running:
+            # Both streams failed inside start()
+            messagebox.showwarning("Audio Device Error",
+                                    "Could not open any audio device.\n\n"
+                                    "Check your device settings and try again.")
+            self.transcriber = None
+            self.status_var.set("Ready")
+            return
+
+        self.meeting_assistant.activate()
+
+        # Seed MEDDPICC from previous calls with this customer
+        previous_meddpicc = get_latest_meddpicc(customer)
+        if previous_meddpicc:
+            self.meeting_assistant.seed_from_previous(previous_meddpicc)
 
         self.transcript_text.config(state=tk.NORMAL)
         self.transcript_text.mark_set("partial_start", "end-1c")
@@ -1106,6 +1506,7 @@ class CallNotesApp:
             return
         self.status_var.set("Stopping recording...")
         self.transcriber.stop()
+        self.meeting_assistant.deactivate()
         transcript = self.transcriber.get_full_transcript()
         self._current_transcript = transcript
 
@@ -1140,7 +1541,6 @@ class CallNotesApp:
         # Mark parallel steps as running
         self.root.after(0, lambda: self._update_checklist("notes", "running"))
         self.root.after(0, lambda: self._update_checklist("email", "running"))
-        self.root.after(0, lambda: self._update_checklist("debrief", "running"))
         self.root.after(0, lambda: self._update_checklist("outlook_task", "running"))
 
         # Shared state for parallel results
@@ -1172,15 +1572,6 @@ class CallNotesApp:
                 results["email_error"] = e
                 self.root.after(0, lambda: self._update_checklist("email", "failed"))
 
-        def run_debrief():
-            try:
-                debrief = extract_debrief(transcript, customer)
-                self.root.after(0, lambda d=debrief: self._populate_debrief(d))
-                self.root.after(0, lambda: self._update_checklist("debrief", "done"))
-            except Exception as e:
-                print(f"[debrief] Error: {e}")
-                self.root.after(0, lambda: self._update_checklist("debrief", "failed"))
-
         def run_outlook_task():
             try:
                 if create_followup_task(customer):
@@ -1193,15 +1584,13 @@ class CallNotesApp:
 
         notes_thread = threading.Thread(target=run_notes, daemon=True)
         email_thread = threading.Thread(target=run_email, daemon=True)
-        debrief_thread = threading.Thread(target=run_debrief, daemon=True)
         outlook_thread = threading.Thread(target=run_outlook_task, daemon=True)
         notes_thread.start()
         email_thread.start()
-        debrief_thread.start()
         outlook_thread.start()
         notes_thread.join()
         email_thread.join()
-        # Don't wait for debrief or outlook task — they'll update the checklist when ready
+        # Don't wait for outlook task — it'll update the checklist when ready
 
         if results["notes_error"]:
             self.root.after(0, lambda: messagebox.showerror(
@@ -1214,9 +1603,12 @@ class CallNotesApp:
         # Save session
         self.root.after(0, lambda: self._update_checklist("save", "running"))
         try:
+            import json as _json
+            meddpicc_data = _json.dumps(self.meeting_assistant.export_state())
             save_session(customer, transcript,
                          results["notes"] or "", results["filepath"] or "",
-                         followup_email=results["email"] or "")
+                         followup_email=results["email"] or "",
+                         meddpicc_data=meddpicc_data)
             self.root.after(0, lambda: self._update_checklist("save", "done"))
         except Exception:
             self.root.after(0, lambda: self._update_checklist("save", "failed"))
@@ -1256,6 +1648,15 @@ class CallNotesApp:
         else:
             self.root.after(0, lambda: self._update_checklist("competitors", "skipped"))
 
+        # Queue MEDDPICC data for end-of-day AWSentral submission
+        try:
+            from transcription.meddpicc_queue import queue_meddpicc
+            meddpicc_path = queue_meddpicc(customer, self.meeting_assistant.export_state())
+            if meddpicc_path:
+                print(f"[meddpicc] Queued for AWSentral: {meddpicc_path}")
+        except Exception as e:
+            print(f"[meddpicc] Queue error: {e}")
+
         # Unlock UI — generation complete
         self._generating = False
 
@@ -1271,6 +1672,10 @@ class CallNotesApp:
 
         self.prep_btn.configure(state=tk.DISABLED, text="⏳ Loading...")
         self.status_var.set(f"Generating pre-call prep for {customer}...")
+
+        # Auto-expand Call Intelligence section for prep content
+        if not self._intel_section._expanded:
+            self._intel_section.toggle()
 
         # Clear AI panel and show status
         self.ai_text.config(state=tk.NORMAL)
@@ -1292,13 +1697,20 @@ class CallNotesApp:
                             fpath = note.get("filepath", "")
                             if fpath and os.path.exists(fpath):
                                 try:
-                                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                                        content = f.read()[:5000]
-                                    local_notes.append({
-                                        "timestamp": note.get("date", ""),
-                                        "notes": content,
-                                        "source": f"[{note.get('source', 'file')}] {note.get('filename', '')}",
-                                    })
+                                    if fpath.lower().endswith(".docx"):
+                                        # Extract text from DOCX files properly
+                                        from docx import Document
+                                        doc = Document(fpath)
+                                        content = "\n".join(p.text for p in doc.paragraphs if p.text.strip())[:5000]
+                                    else:
+                                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                                            content = f.read()[:5000]
+                                    if content.strip():
+                                        local_notes.append({
+                                            "timestamp": note.get("date", ""),
+                                            "notes": content,
+                                            "source": f"[{note.get('source', 'file')}] {note.get('filename', '')}",
+                                        })
                                 except Exception:
                                     pass
                     local_notes = local_notes[:5]

@@ -70,6 +70,11 @@ class LiveTranscriber:
         self._mic_stream = None
         self._thread = None
         self._handler = None
+        self.on_status = None  # Optional callback for connection status messages
+
+        # Reconnection settings
+        self._max_reconnect_attempts = 5
+        self._reconnect_delay_base = 2  # seconds, doubles each attempt
 
         # Separate buffers for mixing
         self._lock = threading.Lock()
@@ -79,18 +84,24 @@ class LiveTranscriber:
     def _system_callback(self, indata, frames, time_info, status):
         if status:
             print(f"System audio status: {status}")
-        with self._lock:
-            self._system_buffer = np.concatenate(
-                [self._system_buffer, indata[:, 0].copy()]
-            )
+        try:
+            with self._lock:
+                self._system_buffer = np.concatenate(
+                    [self._system_buffer, indata[:, 0].copy()]
+                )
+        except Exception as e:
+            print(f"System audio callback error: {e}")
 
     def _mic_callback(self, indata, frames, time_info, status):
         if status:
             print(f"Mic audio status: {status}")
-        with self._lock:
-            self._mic_buffer = np.concatenate(
-                [self._mic_buffer, indata[:, 0].copy()]
-            )
+        try:
+            with self._lock:
+                self._mic_buffer = np.concatenate(
+                    [self._mic_buffer, indata[:, 0].copy()]
+                )
+        except Exception as e:
+            print(f"Mic audio callback error: {e}")
 
     def _get_mixed_chunk(self, num_samples):
         """Extract and mix audio from both buffers. Returns PCM16 bytes or None."""
@@ -163,15 +174,48 @@ class LiveTranscriber:
         )
 
     def _thread_target(self):
-        """Run the async transcription loop in a new event loop."""
+        """Run the async transcription loop with automatic reconnection."""
+        import time as _time
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._run_transcription())
-        except Exception as e:
-            print(f"Transcription error: {e}")
-        finally:
-            loop.close()
+        attempt = 0
+
+        while self._running:
+            try:
+                if attempt > 0:
+                    delay = min(self._reconnect_delay_base * (2 ** (attempt - 1)), 30)
+                    msg = f"⚠️ Transcribe reconnecting (attempt {attempt}/{self._max_reconnect_attempts})..."
+                    print(msg)
+                    if self.on_status:
+                        self.on_status(msg)
+                    _time.sleep(delay)
+                    # Flush stale audio that accumulated during the outage
+                    with self._lock:
+                        self._system_buffer = np.empty((0,), dtype=np.float32)
+                        self._mic_buffer = np.empty((0,), dtype=np.float32)
+
+                loop.run_until_complete(self._run_transcription())
+                # If we get here cleanly, we were stopped intentionally
+                break
+
+            except Exception as e:
+                attempt += 1
+                print(f"Transcription error (attempt {attempt}): {e}")
+
+                if not self._running:
+                    break
+
+                if attempt > self._max_reconnect_attempts:
+                    msg = "❌ Transcribe connection lost — audio still recording, restart to reconnect"
+                    print(msg)
+                    if self.on_status:
+                        self.on_status(msg)
+                    break
+
+            else:
+                attempt = 0  # Reset on clean exit
+
+        loop.close()
 
     def get_audio_devices(self):
         """Return list of available input audio devices."""
@@ -190,26 +234,45 @@ class LiveTranscriber:
         self._mic_buffer = np.empty((0,), dtype=np.float32)
 
         if self.system_device is not None:
-            self._system_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="float32",
-                device=self.system_device,
-                callback=self._system_callback,
-            )
-            self._system_stream.start()
-            print(f"System audio stream started (device {self.system_device})")
+            try:
+                self._system_stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="float32",
+                    device=self.system_device,
+                    callback=self._system_callback,
+                )
+                self._system_stream.start()
+                print(f"System audio stream started (device {self.system_device})")
+            except Exception as e:
+                print(f"Failed to open system audio device {self.system_device}: {e}")
+                self._system_stream = None
+                if self.on_status:
+                    self.on_status(f"⚠️ System audio device failed: {e}")
 
         if self.mic_device is not None:
-            self._mic_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="float32",
-                device=self.mic_device,
-                callback=self._mic_callback,
-            )
-            self._mic_stream.start()
-            print(f"Mic stream started (device {self.mic_device})")
+            try:
+                self._mic_stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="float32",
+                    device=self.mic_device,
+                    callback=self._mic_callback,
+                )
+                self._mic_stream.start()
+                print(f"Mic stream started (device {self.mic_device})")
+            except Exception as e:
+                print(f"Failed to open mic device {self.mic_device}: {e}")
+                self._mic_stream = None
+                if self.on_status:
+                    self.on_status(f"⚠️ Microphone device failed: {e}")
+
+        # If both streams failed, stop
+        if self._system_stream is None and self._mic_stream is None:
+            self._running = False
+            if self.on_status:
+                self.on_status("❌ No audio devices available — check device settings")
+            return
 
         self._thread = threading.Thread(target=self._thread_target, daemon=True)
         self._thread.start()
@@ -218,8 +281,11 @@ class LiveTranscriber:
         self._running = False
         for stream in (self._system_stream, self._mic_stream):
             if stream:
-                stream.stop()
-                stream.close()
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as e:
+                    print(f"Error closing audio stream: {e}")
         self._system_stream = None
         self._mic_stream = None
         if self._thread:
