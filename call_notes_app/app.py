@@ -50,6 +50,21 @@ MEDDPICC_COLORS = {
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# ─── Cached Fonts (avoid GDI handle leak from repeated CTkFont allocations) ───
+_font_cache = {}
+
+def _font(family="Segoe UI", size=11, weight="normal", slant="roman"):
+    """Return a cached CTkFont instance to avoid creating duplicate GDI handles."""
+    key = (family, size, weight, slant)
+    if key not in _font_cache:
+        kwargs = {"family": family, "size": size}
+        if weight == "bold":
+            kwargs["weight"] = "bold"
+        if slant == "italic":
+            kwargs["slant"] = "italic"
+        _font_cache[key] = ctk.CTkFont(**kwargs)
+    return _font_cache[key]
+
 # ─── Theme System ───────────────────────────────────────────────────
 THEMES = {
     "dark": {
@@ -91,7 +106,7 @@ class ToastNotification:
         self._frame = ctk.CTkFrame(parent, fg_color=color, corner_radius=10,
                                     border_width=0)
         ctk.CTkLabel(self._frame, text=message, text_color="#ffffff",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     font=_font(weight="bold"),
                      wraplength=350).pack(padx=16, pady=10)
 
         # Stack below existing toasts
@@ -132,7 +147,7 @@ class CollapsibleSection(ctk.CTkFrame):
         arrow = "▼" if expanded else "▶"
         self._toggle_label = ctk.CTkLabel(
             self._header, text=f"{arrow} {icon}  {title}",
-            font=ctk.CTkFont("Segoe UI", 11, "bold"), text_color=FG_BRIGHT,
+            font=_font(weight="bold"), text_color=FG_BRIGHT,
             anchor="w", cursor="hand2")
         self._toggle_label.pack(side=tk.LEFT, padx=0)
 
@@ -186,7 +201,7 @@ class StyledText(tk.Text):
 def _make_wrapping_label(parent, text, text_color=FG_TEXT, font=None, **pack_kwargs):
     """Create a CTkLabel that auto-wraps text to fit its parent's width on resize."""
     if font is None:
-        font = ctk.CTkFont("Segoe UI", 12)
+        font = _font(size=12)
     lbl = ctk.CTkLabel(parent, text=text, text_color=text_color, font=font,
                         anchor=tk.W, wraplength=1)
     lbl._last_wrap_width = 0
@@ -245,11 +260,11 @@ class CallNotesApp:
             title_bar = ctk.CTkFrame(self.root, fg_color="transparent")
             title_bar.pack(fill=tk.X, padx=20, pady=(16, 0))
             ctk.CTkLabel(title_bar, text="🎙  Call Notes",
-                         font=ctk.CTkFont("Segoe UI", 20, "bold"),
+                         font=_font(size=20, weight="bold"),
                          text_color=FG_BRIGHT).pack(side=tk.LEFT)
             self.status_var = tk.StringVar(value="Ready")
             ctk.CTkLabel(title_bar, textvariable=self.status_var,
-                         font=ctk.CTkFont("Segoe UI", 12), text_color=ORANGE
+                         font=_font(size=12), text_color=ORANGE
                          ).pack(side=tk.RIGHT)
         else:
             self.status_var = tk.StringVar(value="Ready")
@@ -283,7 +298,7 @@ class CallNotesApp:
             status_bar = ctk.CTkFrame(self.root, fg_color=BG_CARD, corner_radius=0, height=28)
             status_bar.pack(fill=tk.X, side=tk.BOTTOM)
             ctk.CTkLabel(status_bar, textvariable=self.status_var,
-                         text_color=ORANGE, font=ctk.CTkFont("Segoe UI", 11),
+                         text_color=ORANGE, font=_font(),
                          anchor="w").pack(side=tk.LEFT, padx=12, pady=4)
 
         self.root.after(500, self._refresh_history)
@@ -294,25 +309,25 @@ class CallNotesApp:
         card.pack(fill=tk.BOTH, expand=True)
 
         ctk.CTkLabel(card, text="📋  History",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
+                     font=_font(size=13, weight="bold"),
                      text_color=FG_BRIGHT).pack(anchor=tk.W, padx=14, pady=(14, 8))
 
         filt = ctk.CTkFrame(card, fg_color="transparent")
         filt.pack(fill=tk.X, padx=12, pady=(0, 8))
         ctk.CTkLabel(filt, text="Filter:", text_color=FG_DIM,
-                     font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
+                     font=_font()).pack(side=tk.LEFT)
         self.history_filter_var = tk.StringVar(value="(All)")
         self.history_filter_combo = ctk.CTkComboBox(
             filt, variable=self.history_filter_var, width=140,
             fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
             button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
             dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
+            font=_font(), state="readonly",
             command=lambda _: self._refresh_history())
         self.history_filter_combo.pack(side=tk.LEFT, padx=(6, 4))
         ctk.CTkButton(filt, text="⟳", width=32, height=28, fg_color=BG_INPUT,
                       hover_color=BG_CARD, text_color=ACCENT, corner_radius=6,
-                      font=ctk.CTkFont("Segoe UI", 13),
+                      font=_font(size=13),
                       command=self._refresh_history).pack(side=tk.LEFT)
 
         lf = ctk.CTkFrame(card, fg_color=BG_INPUT, corner_radius=10,
@@ -333,11 +348,18 @@ class CallNotesApp:
                              border_width=1, border_color=BORDER)
         card.pack(fill=tk.BOTH, expand=True)
 
-        # ── Scrollable wrapper for all center panel content ──
-        self._center_canvas = tk.Canvas(card, bg=BG_PANEL, highlightthickness=0,
+        # ── Fixed top section (controls + buttons) ──
+        top_fixed = ctk.CTkFrame(card, fg_color="transparent")
+        top_fixed.pack(fill=tk.X, side=tk.TOP)
+
+        # ── Scrollable bottom section (checklist, transcript, notes, email) ──
+        scroll_wrapper = ctk.CTkFrame(card, fg_color="transparent")
+        scroll_wrapper.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+
+        self._center_canvas = tk.Canvas(scroll_wrapper, bg=BG_PANEL, highlightthickness=0,
                                          borderwidth=0)
         self._center_scrollbar = ctk.CTkScrollbar(
-            card, command=self._center_canvas.yview,
+            scroll_wrapper, command=self._center_canvas.yview,
             fg_color=BG_PANEL, button_color="#2a2a2a",
             button_hover_color=ACCENT, width=8)
         self._center_canvas.configure(yscrollcommand=self._center_scrollbar.set)
@@ -358,9 +380,12 @@ class CallNotesApp:
         self._center_inner.bind("<Configure>", _on_center_configure)
         self._center_canvas.bind("<Configure>", _on_canvas_resize)
 
-        # Mousewheel scrolling
+        # Mousewheel scrolling — scoped to avoid cross-tab interference
         def _on_mousewheel(event):
-            self._center_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            try:
+                self._center_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except tk.TclError:
+                pass
 
         def _bind_mousewheel(event):
             self._center_canvas.bind_all("<MouseWheel>", _on_mousewheel)
@@ -371,22 +396,22 @@ class CallNotesApp:
         self._center_canvas.bind("<Enter>", _bind_mousewheel)
         self._center_canvas.bind("<Leave>", _unbind_mousewheel)
 
-        # All content goes into _center_inner instead of card
+        # Fixed content goes into top_fixed, scrollable content into _center_inner
         inner = self._center_inner
 
-        # Controls grid
-        ctrl = ctk.CTkFrame(inner, fg_color="transparent")
+        # Controls grid (fixed top)
+        ctrl = ctk.CTkFrame(top_fixed, fg_color="transparent")
         ctrl.pack(fill=tk.X, padx=16, pady=(14, 8))
 
         for i, (label, var_name, placeholder) in enumerate([
             ("Customer Name:", "customer_var", "Enter customer name..."),
         ]):
             ctk.CTkLabel(ctrl, text=label, text_color=FG_DIM,
-                         font=ctk.CTkFont("Segoe UI", 12)).grid(row=i, column=0, sticky=tk.W, pady=3)
+                         font=_font(size=12)).grid(row=i, column=0, sticky=tk.W, pady=3)
             setattr(self, var_name, tk.StringVar())
             ctk.CTkEntry(ctrl, textvariable=getattr(self, var_name), width=280,
                          fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
-                         font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+                         font=_font(), corner_radius=6,
                          placeholder_text=placeholder
                          ).grid(row=i, column=1, padx=(10, 0), sticky=tk.W, pady=3)
 
@@ -398,88 +423,91 @@ class CallNotesApp:
             ("Microphone:", self.mic_device_var),
         ], start=1):
             ctk.CTkLabel(ctrl, text=label, text_color=FG_DIM,
-                         font=ctk.CTkFont("Segoe UI", 12)).grid(row=i, column=0, sticky=tk.W, pady=3)
+                         font=_font(size=12)).grid(row=i, column=0, sticky=tk.W, pady=3)
             combo = ctk.CTkComboBox(
                 ctrl, variable=var, width=400, fg_color=BG_INPUT, border_color=BORDER,
                 button_color=BORDER, button_hover_color=ACCENT,
                 dropdown_fg_color=BG_INPUT, dropdown_hover_color=ACCENT,
-                text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 10), state="readonly")
+                text_color=FG_BRIGHT, font=_font(size=10), state="readonly")
             combo.grid(row=i, column=1, padx=(10, 0), sticky=tk.W, pady=3)
             if i == 1:
                 self.system_device_combo = combo
             else:
                 self.mic_device_combo = combo
 
-        # Buttons — Row 1: Recording controls
-        row1 = ctk.CTkFrame(inner, fg_color="transparent")
+        # Buttons — Row 1: Recording controls (fixed top)
+        row1 = ctk.CTkFrame(top_fixed, fg_color="transparent")
         row1.pack(fill=tk.X, padx=16, pady=(4, 4))
 
         self.start_btn = ctk.CTkButton(
             row1, text="▶  Start Recording", fg_color=GREEN, hover_color=GREEN_HOVER,
-            text_color=BG_DARK, font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            text_color=BG_DARK, font=_font(size=12, weight="bold"),
             corner_radius=10, height=38, command=self._start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self.stop_btn = ctk.CTkButton(
             row1, text="⏹  Stop & Generate", fg_color=RED, hover_color=RED_HOVER,
-            text_color=BG_DARK, font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            text_color=BG_DARK, font=_font(size=12, weight="bold"),
             corner_radius=10, height=38, state=tk.DISABLED, command=self._stop)
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         # Pulsing recording indicator
         self._recording_dot = ctk.CTkLabel(
             row1, text="  🔴 REC", text_color=RED,
-            font=ctk.CTkFont("Segoe UI", 11, "bold"))
+            font=_font(weight="bold"))
         # Hidden by default — shown when recording starts
 
         self.prep_btn = ctk.CTkButton(
             row1, text="📋 Pre-Call Prep", fg_color=BG_INPUT, hover_color=BG_CARD,
-            text_color=ACCENT, font=ctk.CTkFont("Segoe UI", 11, "bold"), corner_radius=10,
+            text_color=ACCENT, font=_font(weight="bold"), corner_radius=10,
             height=36, border_width=1, border_color=ACCENT,
             command=self._generate_prep)
         self.prep_btn.pack(side=tk.RIGHT)
 
-        # Buttons — Row 2: Post-call actions
-        row2 = ctk.CTkFrame(inner, fg_color="transparent")
+        # Buttons — Row 2: Post-call actions (fixed top)
+        row2 = ctk.CTkFrame(top_fixed, fg_color="transparent")
         row2.pack(fill=tk.X, padx=16, pady=(0, 8))
 
         ctk.CTkLabel(row2, text="Post-call:", text_color=FG_DIM,
-                     font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+                     font=_font(size=10)).pack(side=tk.LEFT, padx=(0, 6))
 
         self.export_docx_btn = ctk.CTkButton(
             row2, text="📄 DOCX", fg_color="#1f2937", hover_color=ACCENT,
-            text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
+            text_color=FG_BRIGHT, font=_font(size=10), corner_radius=8,
             height=30, width=70, border_width=1, border_color="#374151", state=tk.DISABLED,
             command=self._export_docx)
         self.export_docx_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         self.export_pdf_btn = ctk.CTkButton(
             row2, text="📑 PDF", fg_color="#1f2937", hover_color=ACCENT,
-            text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
+            text_color=FG_BRIGHT, font=_font(size=10), corner_radius=8,
             height=30, width=60, border_width=1, border_color="#374151", state=tk.DISABLED,
             command=self._export_pdf)
         self.export_pdf_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         self.share_html_btn = ctk.CTkButton(
             row2, text="🔗 Share", fg_color="#1f2937", hover_color=ACCENT,
-            text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
+            text_color=FG_BRIGHT, font=_font(size=10), corner_radius=8,
             height=30, width=70, border_width=1, border_color="#374151", state=tk.DISABLED,
             command=self._export_share_html)
         self.share_html_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         self.sift_btn = ctk.CTkButton(
             row2, text="📊 SIFT", fg_color="#1f2937", hover_color=ACCENT,
-            text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
+            text_color=FG_BRIGHT, font=_font(size=10), corner_radius=8,
             height=30, width=65, border_width=1, border_color="#374151", state=tk.DISABLED,
             command=self._submit_sift)
         self.sift_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         self.activity_btn = ctk.CTkButton(
             row2, text="📝 Activity", fg_color="#1f2937", hover_color=ACCENT,
-            text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 10), corner_radius=8,
+            text_color=FG_BRIGHT, font=_font(size=10), corner_radius=8,
             height=30, width=80, border_width=1, border_color="#374151", state=tk.DISABLED,
             command=self._log_activity)
         self.activity_btn.pack(side=tk.LEFT)
+
+        # Subtle separator between fixed and scrollable areas
+        ctk.CTkFrame(top_fixed, fg_color=BORDER, height=1).pack(fill=tk.X, padx=16, pady=(4, 0))
 
         # ── Post-Call Progress Checklist ──
         self._checklist_frame = ctk.CTkFrame(inner, fg_color=BG_INPUT, corner_radius=10,
@@ -497,22 +525,22 @@ class CallNotesApp:
         checklist_header = ctk.CTkFrame(self._checklist_frame, fg_color="transparent")
         checklist_header.pack(fill=tk.X, padx=10, pady=(8, 4))
         ctk.CTkLabel(checklist_header, text="⏳  Post-Call Progress",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     font=_font(weight="bold"),
                      text_color=FG_BRIGHT).pack(side=tk.LEFT)
         self._checklist_dismiss_btn = ctk.CTkButton(
             checklist_header, text="✕", width=24, height=24,
             fg_color="transparent", hover_color=BG_CARD, text_color=FG_DIM,
-            font=ctk.CTkFont("Segoe UI", 11), corner_radius=4,
+            font=_font(), corner_radius=4,
             command=self._hide_checklist)
         self._checklist_dismiss_btn.pack(side=tk.RIGHT)
         for key, label in self._checklist_steps:
             row = ctk.CTkFrame(self._checklist_frame, fg_color="transparent")
             row.pack(fill=tk.X, padx=14, pady=1)
             status_lbl = ctk.CTkLabel(row, text="⬜", width=20,
-                                       font=ctk.CTkFont("Segoe UI", 11))
+                                       font=_font())
             status_lbl.pack(side=tk.LEFT)
             text_lbl = ctk.CTkLabel(row, text=label, text_color=FG_DIM,
-                                     font=ctk.CTkFont("Segoe UI", 10))
+                                     font=_font(size=10))
             text_lbl.pack(side=tk.LEFT, padx=(4, 0))
             self._checklist_items[key] = "pending"
             self._checklist_labels[key] = (status_lbl, text_lbl)
@@ -528,12 +556,12 @@ class CallNotesApp:
         self.copy_transcript_btn = ctk.CTkButton(
             transcript_header, text="📋 Copy Transcript", width=130, height=28,
             fg_color="#1f2937", hover_color=ACCENT, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+            font=_font(), corner_radius=6,
             border_width=1, border_color=BORDER, state=tk.DISABLED,
             command=self._copy_transcript)
         self.copy_transcript_btn.pack(side=tk.RIGHT)
-        self.transcript_text = StyledText(self._transcript_section.content, height=8, font=("Consolas", 10))
-        self.transcript_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self.transcript_text = StyledText(self._transcript_section.content, height=12, font=("Consolas", 10))
+        self.transcript_text.pack(fill=tk.X, pady=(0, 4))
 
         # ── Collapsible: Manual Notes ──
         self._manual_notes_section = CollapsibleSection(inner, "Manual Notes", icon="✏️")
@@ -542,19 +570,19 @@ class CallNotesApp:
         manual_hint = ctk.CTkLabel(
             self._manual_notes_section.content,
             text="Attendee corrections, focus areas, or context for the AI — sent alongside the transcript.",
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10), anchor=tk.W)
+            text_color=FG_DIM, font=_font(size=10), anchor=tk.W)
         manual_hint.pack(fill=tk.X, pady=(0, 4))
 
         self.manual_notes_text = StyledText(
             self._manual_notes_section.content, height=4, font=("Segoe UI", 10))
         self.manual_notes_text.configure(state=tk.NORMAL)
-        self.manual_notes_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self.manual_notes_text.pack(fill=tk.X, pady=(0, 4))
 
         # ── Collapsible: Notes ──
         self._notes_section = CollapsibleSection(inner, "Generated Notes", icon="📝", expanded=False)
         self._notes_section.pack(fill=tk.X, padx=16, pady=(0, 4))
-        self.notes_text = StyledText(self._notes_section.content, height=8)
-        self.notes_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self.notes_text = StyledText(self._notes_section.content, height=12)
+        self.notes_text.pack(fill=tk.X, pady=(0, 4))
 
         # ── Collapsible: Follow-Up Email ──
         self._email_section = CollapsibleSection(inner, "Follow-Up Email", icon="📧", expanded=False)
@@ -565,12 +593,12 @@ class CallNotesApp:
         self.outlook_draft_btn = ctk.CTkButton(
             email_header, text="📨 Outlook Draft", width=120, height=28,
             fg_color="#1f2937", hover_color=ACCENT, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+            font=_font(), corner_radius=6,
             border_width=1, border_color=BORDER, state=tk.DISABLED,
             command=self._send_to_outlook_draft)
         self.outlook_draft_btn.pack(side=tk.RIGHT)
-        self.email_text = StyledText(self._email_section.content, height=6, font=("Segoe UI", 10))
-        self.email_text.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self.email_text = StyledText(self._email_section.content, height=8, font=("Segoe UI", 10))
+        self.email_text.pack(fill=tk.X, pady=(0, 4))
 
 
     # ── Right: Call Intelligence Panel ──
@@ -588,7 +616,7 @@ class CallNotesApp:
         intel_top.pack(fill=tk.X, padx=2, pady=(4, 4))
         ctk.CTkButton(intel_top, text="Clear", width=60, height=28, fg_color=BG_INPUT,
                       hover_color=BG_CARD, text_color=ACCENT, corner_radius=6,
-                      font=ctk.CTkFont("Segoe UI", 11),
+                      font=_font(),
                       command=self._clear_ai_answers).pack(side=tk.RIGHT)
 
         # AI text display (used by prep summaries)
@@ -609,7 +637,7 @@ class CallNotesApp:
             lbl = ctk.CTkLabel(coverage_frame, text=abbr, width=28, height=24,
                                fg_color=BG_DARK, corner_radius=4,
                                text_color=FG_DIM, cursor="hand2",
-                               font=ctk.CTkFont("Segoe UI", 10, "bold"))
+                               font=_font(size=10, weight="bold"))
             lbl.pack(side=tk.LEFT, padx=2)
             lbl.bind("<Button-1>", lambda e, el=element: self._show_question_history(el, e))
             self._coverage_labels[element] = lbl
@@ -657,7 +685,7 @@ class CallNotesApp:
         # Inactive state message
         self._meddpicc_status_label = ctk.CTkLabel(self._suggestions_frame,
             text="Activates during live calls",
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 9, slant="italic"))
+            text_color=FG_DIM, font=_font(size=9, slant="italic"))
         self._meddpicc_status_label.pack(pady=4)
 
     # ─────────────────────────── CALLBACKS ───────────────────────────
@@ -669,6 +697,14 @@ class CallNotesApp:
             pass
         if self._is_root:
             self.root.destroy()
+
+    def _suggestions_wrap_width(self):
+        """Get current wrap width for labels in the suggestions panel (one-shot, no binding)."""
+        try:
+            w = self._suggestions_canvas.winfo_width() - 60
+            return max(w, 200)
+        except Exception:
+            return 280
 
     def _toggle_ai(self):
         pass  # No longer needed — kept for compatibility
@@ -742,10 +778,11 @@ class CallNotesApp:
             first_existing = row  # Next one goes before this one
             ctk.CTkLabel(row, text=f"[{element}]",
                          text_color=color,
-                         font=ctk.CTkFont("Segoe UI", 11, "bold")).pack(anchor=tk.W, padx=10, pady=(6, 0))
-            _make_wrapping_label(row, question, text_color=FG_TEXT,
-                                 font=ctk.CTkFont("Segoe UI", 12),
-                                 padx=10, pady=(2, 6))
+                         font=_font(weight="bold")).pack(anchor=tk.W, padx=10, pady=(6, 0))
+            ctk.CTkLabel(row, text=question, text_color=FG_TEXT,
+                         font=_font(size=12),
+                         anchor=tk.W, wraplength=self._suggestions_wrap_width()).pack(
+                anchor=tk.W, fill=tk.X, padx=10, pady=(2, 6))
             self._rendered_questions.add(question)
 
         # Ensure status label exists at the bottom
@@ -756,7 +793,7 @@ class CallNotesApp:
                 break
         if not has_status:
             self._meddpicc_status_label = ctk.CTkLabel(self._suggestions_frame,
-                text="", text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 9, slant="italic"))
+                text="", text_color=FG_DIM, font=_font(size=9, slant="italic"))
             self._meddpicc_status_label.pack(pady=0)
 
         # If panel is completely empty, show placeholder
@@ -764,7 +801,7 @@ class CallNotesApp:
                          if isinstance(w, ctk.CTkFrame) and hasattr(w, '_question_text')]
         if not visible_cards and not new_questions:
             ctk.CTkLabel(self._suggestions_frame, text="No new suggestions — listening...",
-                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11, slant="italic")).pack(pady=4)
+                         text_color=FG_DIM, font=_font(slant="italic")).pack(pady=4)
 
     def _update_meddpicc_status(self, message):
         """Update the MEDDPICC status message."""
@@ -817,17 +854,17 @@ class CallNotesApp:
         header.pack(fill=tk.X, padx=10, pady=(8, 4))
         ctk.CTkLabel(header, text=f"📋 {element}",
                      text_color=color,
-                     font=ctk.CTkFont("Segoe UI", 13, "bold")).pack(side=tk.LEFT)
+                     font=_font(size=13, weight="bold")).pack(side=tk.LEFT)
         ctk.CTkButton(header, text="✕", width=22, height=22,
                       fg_color="transparent", hover_color=BG_CARD,
-                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10),
+                      text_color=FG_DIM, font=_font(size=10),
                       corner_radius=4,
                       command=popup.destroy).pack(side=tk.RIGHT)
 
         # Question list
         if not questions:
             ctk.CTkLabel(outer, text="No questions generated yet for this element.",
-                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11, slant="italic")
+                         text_color=FG_DIM, font=_font(slant="italic")
                          ).pack(padx=12, pady=(4, 10))
         else:
             for q in questions:
@@ -837,17 +874,18 @@ class CallNotesApp:
                 row = ctk.CTkFrame(outer, fg_color=BG_CARD if not addressed else "#0d2818",
                                    corner_radius=6)
                 row.pack(fill=tk.X, padx=10, pady=2)
-                _make_wrapping_label(row, f"{icon} {q['question']}",
-                                     text_color=q_color,
-                                     font=ctk.CTkFont("Segoe UI", 11),
-                                     padx=10, pady=5)
+                ctk.CTkLabel(row, text=f"{icon} {q['question']}",
+                             text_color=q_color,
+                             font=_font(),
+                             anchor=tk.W, wraplength=300).pack(
+                    anchor=tk.W, fill=tk.X, padx=10, pady=5)
 
         # Summary line
         total = len(questions)
         addressed_count = sum(1 for q in questions if q.get("addressed"))
         if total > 0:
             ctk.CTkLabel(outer, text=f"{addressed_count}/{total} addressed",
-                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 9)).pack(pady=(2, 8))
+                         text_color=FG_DIM, font=_font(size=9)).pack(pady=(2, 8))
         else:
             ctk.CTkFrame(outer, fg_color="transparent", height=4).pack()
 
@@ -871,7 +909,7 @@ class CallNotesApp:
 
         # Title
         ctk.CTkLabel(self._suggestions_frame, text="MEDDPICC Coverage Summary",
-                     text_color=FG_BRIGHT, font=ctk.CTkFont("Segoe UI", 12, "bold")
+                     text_color=FG_BRIGHT, font=_font(size=12, weight="bold")
                      ).pack(anchor=tk.W, pady=(4, 2))
 
         # Compact summary: one line per element, no follow-up lines
@@ -882,10 +920,11 @@ class CallNotesApp:
             if line.startswith("↳"):
                 continue  # skip verbose follow-up lines
             text_color = ACCENT if line.startswith("✅") else (RED if line.startswith("❌") else FG_TEXT)
-            _make_wrapping_label(self._suggestions_frame, line,
-                                 text_color=text_color,
-                                 font=ctk.CTkFont("Segoe UI", 11),
-                                 padx=4, pady=1)
+            ctk.CTkLabel(self._suggestions_frame, text=line,
+                         text_color=text_color,
+                         font=_font(),
+                         anchor=tk.W, wraplength=self._suggestions_wrap_width()).pack(
+                anchor=tk.W, fill=tk.X, padx=4, pady=1)
 
     def _render_historical_meddpicc(self, coverage, questions):
         """Render MEDDPICC coverage and question history for a loaded historical session."""
@@ -911,7 +950,7 @@ class CallNotesApp:
                                 if coverage.get(e, {}).get("covered", False))
             ctk.CTkLabel(self._suggestions_frame,
                          text=f"MEDDPICC: {covered_count}/8 covered · No questions recorded",
-                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(pady=4)
+                         text_color=FG_DIM, font=_font(size=10)).pack(pady=4)
             return
 
         # Group questions by element
@@ -933,14 +972,14 @@ class CallNotesApp:
             ctk.CTkLabel(self._suggestions_frame,
                          text=f"{status_icon} {element}",
                          text_color=color,
-                         font=ctk.CTkFont("Segoe UI", 11, "bold")).pack(anchor=tk.W, padx=4, pady=(6, 2))
+                         font=_font(weight="bold")).pack(anchor=tk.W, padx=4, pady=(6, 2))
 
             # Evidence if covered
             if covered and isinstance(info, dict) and info.get("evidence"):
                 ctk.CTkLabel(self._suggestions_frame,
                              text=f"   Evidence: {info['evidence']}",
                              text_color=FG_DIM,
-                             font=ctk.CTkFont("Segoe UI", 9, slant="italic")).pack(anchor=tk.W, padx=8, pady=0)
+                             font=_font(size=9, slant="italic")).pack(anchor=tk.W, padx=8, pady=0)
 
             for q in qs:
                 addressed = q.get("addressed", False)
@@ -950,10 +989,11 @@ class CallNotesApp:
                                    fg_color="#0d2818" if addressed else BG_CARD,
                                    corner_radius=6)
                 row.pack(fill=tk.X, padx=8, pady=1)
-                _make_wrapping_label(row, f"{icon} {q['question']}",
-                                     text_color=q_color,
-                                     font=ctk.CTkFont("Segoe UI", 11),
-                                     padx=10, pady=4)
+                ctk.CTkLabel(row, text=f"{icon} {q['question']}",
+                             text_color=q_color,
+                             font=_font(),
+                             anchor=tk.W, wraplength=self._suggestions_wrap_width()).pack(
+                    anchor=tk.W, fill=tk.X, padx=10, pady=4)
 
     def _check_transcript_for_questions(self, text):
         """Feed finalized transcript line to the MEDDPICC meeting assistant."""
@@ -1133,7 +1173,7 @@ class CallNotesApp:
             for widget in self._suggestions_frame.winfo_children():
                 widget.destroy()
             ctk.CTkLabel(self._suggestions_frame, text="No MEDDPICC data for this session",
-                         text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10, slant="italic")).pack(pady=4)
+                         text_color=FG_DIM, font=_font(size=10, slant="italic")).pack(pady=4)
 
     # ─────────────────────────── EXPORT ───────────────────────────
 
@@ -1505,32 +1545,40 @@ class CallNotesApp:
         if not self.transcriber:
             return
         self.status_var.set("Stopping recording...")
-        self.transcriber.stop()
+        self.stop_btn.configure(state=tk.DISABLED)
+        self._stop_recording_pulse()
+
+        # Run the blocking stop + generate on a background thread
+        # so the UI stays responsive while the Transcribe stream closes.
+        threading.Thread(target=self._stop_and_generate, daemon=True).start()
+
+    def _stop_and_generate(self):
+        """Background thread: stop transcriber, then kick off note generation."""
+        self.transcriber.stop()                       # blocks up to 10s
         self.meeting_assistant.deactivate()
         transcript = self.transcriber.get_full_transcript()
         self._current_transcript = transcript
 
-        self.start_btn.configure(state=tk.NORMAL)
-        self.stop_btn.configure(state=tk.DISABLED)
+        # UI updates must happen on the main thread
+        def _continue_on_ui():
+            self.start_btn.configure(state=tk.NORMAL)
 
-        self._stop_recording_pulse()
+            if not transcript:
+                self.status_var.set("No speech detected.")
+                self._update_window_title()
+                messagebox.showinfo("Empty", "No transcript was captured.")
+                return
 
-        if not transcript:
-            self.status_var.set("No speech detected.")
-            self._update_window_title()
-            messagebox.showinfo("Empty", "No transcript was captured.")
-            return
+            self._locked_customer = self.customer_var.get().strip() or "Unknown"
+            self._generating = True
 
-        # Lock the customer name at the moment Stop is clicked
-        self._locked_customer = self.customer_var.get().strip() or "Unknown"
-        self._generating = True
-        # History clicks are guarded by _generating flag — no need to disable the list.
-        # Customer field stays editable so you can type a new name for the next call.
+            self.status_var.set("Generating notes & follow-up email...")
+            manual_notes = self.manual_notes_text.get("1.0", tk.END).strip()
+            threading.Thread(target=self._generate_and_save,
+                             args=(transcript, manual_notes),
+                             daemon=True).start()
 
-        self.status_var.set("Generating notes & follow-up email...")
-        manual_notes = self.manual_notes_text.get("1.0", tk.END).strip()
-        threading.Thread(target=self._generate_and_save, args=(transcript, manual_notes),
-                         daemon=True).start()
+        self.root.after(0, _continue_on_ui)
 
     def _generate_and_save(self, transcript, manual_notes=""):
         customer = self._locked_customer
@@ -1836,28 +1884,28 @@ class NotesRetrieverTab:
         top.pack(fill=tk.X, padx=16, pady=(14, 6))
 
         ctk.CTkLabel(top, text="📂  Historical Notes Retrieval",
-                     font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                     font=_font(size=15, weight="bold"),
                      text_color=FG_BRIGHT).pack(side=tk.LEFT)
 
         ctk.CTkButton(
             top, text="＋ New Chat", width=110, height=30,
             fg_color=GREEN, hover_color=GREEN_HOVER, text_color=BG_DARK,
             border_width=0, corner_radius=6,
-            font=ctk.CTkFont("Segoe UI", 11, "bold"),
+            font=_font(weight="bold"),
             command=self._new_chat).pack(side=tk.RIGHT, padx=(8, 0))
 
         ctk.CTkButton(
             top, text="⟳ Refresh Index", width=130, height=30,
             fg_color=BG_INPUT, hover_color=BG_CARD, text_color=ACCENT,
             border_width=1, border_color=BORDER, corner_radius=6,
-            font=ctk.CTkFont("Segoe UI", 11),
+            font=_font(),
             command=lambda: threading.Thread(target=self._refresh_index, daemon=True).start()
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
         # Clickable index summary
         self.index_label = ctk.CTkLabel(
             top, text="Scanning...", text_color=ACCENT,
-            font=ctk.CTkFont("Segoe UI", 11), cursor="hand2")
+            font=_font(), cursor="hand2")
         self.index_label.pack(side=tk.RIGHT, padx=(0, 12))
         self.index_label.bind("<Button-1>", lambda e: self._toggle_index_panel())
 
@@ -1868,11 +1916,11 @@ class NotesRetrieverTab:
         index_header = ctk.CTkFrame(self._index_panel, fg_color="transparent")
         index_header.pack(fill=tk.X, padx=10, pady=(8, 4))
         ctk.CTkLabel(index_header, text="Indexed Notes",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     font=_font(weight="bold"),
                      text_color=ACCENT).pack(side=tk.LEFT)
         ctk.CTkButton(index_header, text="✕", width=28, height=24,
                       fg_color="transparent", hover_color=BG_INPUT,
-                      text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11),
+                      text_color=FG_DIM, font=_font(),
                       command=self._toggle_index_panel).pack(side=tk.RIGHT)
         list_frame = ctk.CTkFrame(self._index_panel, fg_color=BG_INPUT, corner_radius=6)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -1905,11 +1953,11 @@ class NotesRetrieverTab:
         sh_header = ctk.CTkFrame(sidebar, fg_color="transparent")
         sh_header.pack(fill=tk.X, padx=10, pady=(10, 4))
         ctk.CTkLabel(sh_header, text="🕘 History",
-                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     font=_font(size=12, weight="bold"),
                      text_color=ACCENT).pack(side=tk.LEFT)
         ctk.CTkButton(sh_header, text="⟳", width=28, height=24,
                       fg_color="transparent", hover_color=BG_INPUT,
-                      text_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
+                      text_color=ACCENT, font=_font(size=12),
                       command=lambda: threading.Thread(
                           target=self._load_session_history, daemon=True).start()
                       ).pack(side=tk.RIGHT)
@@ -1935,7 +1983,7 @@ class NotesRetrieverTab:
         ctk.CTkButton(sh_btn_row, text="🗑 Delete", width=90, height=26,
                       fg_color=BG_INPUT, hover_color=RED, text_color=FG_BRIGHT,
                       border_width=1, border_color=BORDER, corner_radius=6,
-                      font=ctk.CTkFont("Segoe UI", 10),
+                      font=_font(size=10),
                       command=self._delete_selected_session).pack(side=tk.LEFT)
 
         # ── Right: main content ────────────────────────────────────────────
@@ -1948,7 +1996,7 @@ class NotesRetrieverTab:
         filter_row = ctk.CTkFrame(main, fg_color="transparent")
         filter_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ctk.CTkLabel(filter_row, text="Source:",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
+                     text_color=FG_DIM, font=_font()).pack(side=tk.LEFT)
         self.source_filter_var = tk.StringVar(value="All Sources")
         source_options = ["All Sources"] + [label for _, label in NOTE_SOURCES]
         self.source_combo = ctk.CTkComboBox(
@@ -1956,30 +2004,30 @@ class NotesRetrieverTab:
             fg_color=BG_INPUT, border_color=BORDER, button_color=BORDER,
             button_hover_color=ACCENT, dropdown_fg_color=BG_INPUT,
             dropdown_hover_color=ACCENT, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), state="readonly",
+            font=_font(), state="readonly",
             values=source_options,
             command=lambda _: self._new_chat())
         self.source_combo.pack(side=tk.LEFT, padx=(8, 16))
         ctk.CTkLabel(filter_row, text="Customer:",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)).pack(side=tk.LEFT)
+                     text_color=FG_DIM, font=_font()).pack(side=tk.LEFT)
         self.customer_filter_var = tk.StringVar(value="(All)")
         self._customer_values = ["(All)"]
         self.customer_btn = ctk.CTkButton(
             filter_row, textvariable=self.customer_filter_var, width=200,
             fg_color=BG_INPUT, hover_color=BG_CARD, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+            font=_font(), corner_radius=6,
             border_width=1, border_color=BORDER, anchor="w",
             command=self._open_customer_picker)
         self.customer_btn.pack(side=tk.LEFT, padx=(8, 0))
         ctk.CTkLabel(filter_row,
                      text="  (changing filters starts a new chat)",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
+                     text_color=FG_DIM, font=_font(size=10)).pack(side=tk.LEFT)
 
         # Suggested prompts
         prompts_frame = ctk.CTkFrame(main, fg_color="transparent")
         prompts_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         ctk.CTkLabel(prompts_frame, text="Suggestions:",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
+                     text_color=FG_DIM, font=_font(size=10)).pack(side=tk.LEFT)
         for prompt in [
             "What action items are outstanding?",
             "Summarize all calls with this customer",
@@ -1990,7 +2038,7 @@ class NotesRetrieverTab:
                 prompts_frame, text=prompt, height=24,
                 fg_color=BG_CARD, hover_color=ACCENT, text_color=FG_BRIGHT,
                 border_width=1, border_color=BORDER, corner_radius=12,
-                font=ctk.CTkFont("Segoe UI", 10),
+                font=_font(size=10),
                 command=lambda p=prompt: self._use_suggestion(p)
             ).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -2005,15 +2053,15 @@ class NotesRetrieverTab:
         chat_header = ctk.CTkFrame(chat_outer, fg_color="transparent")
         chat_header.grid(row=0, column=0, sticky="new", padx=12, pady=(10, 4))
         ctk.CTkLabel(chat_header, text="Chat",
-                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     font=_font(size=12, weight="bold"),
                      text_color=YELLOW).pack(side=tk.LEFT)
         self.turn_label = ctk.CTkLabel(
             chat_header, text="New conversation",
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
+            text_color=FG_DIM, font=_font(size=10))
         self.turn_label.pack(side=tk.LEFT, padx=(10, 0))
         self.model_label = ctk.CTkLabel(
             chat_header, text="📋 Notes Retrieval  ·  Claude Opus 4.6  ·  Bedrock",
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
+            text_color=FG_DIM, font=_font(size=10))
         self.model_label.pack(side=tk.RIGHT)
 
         self.chat_text = StyledText(chat_outer, font=("Segoe UI", 10))
@@ -2038,7 +2086,7 @@ class NotesRetrieverTab:
         self.input_entry = ctk.CTkEntry(
             input_row, textvariable=self.input_var,
             fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 12), corner_radius=6,
+            font=_font(size=12), corner_radius=6,
             placeholder_text="Ask about your historical call notes...")
         self.input_entry.grid(row=0, column=0, sticky="ew", padx=(10, 6), pady=8)
         self.input_entry.bind("<Return>", lambda e: self._send())
@@ -2046,7 +2094,7 @@ class NotesRetrieverTab:
         self.send_btn = ctk.CTkButton(
             input_row, text="Send ↵", width=90, height=36,
             fg_color=YELLOW, hover_color=YELLOW_HOVER, text_color=BG_DARK,
-            font=ctk.CTkFont("Segoe UI", 12, "bold"), corner_radius=6,
+            font=_font(size=12, weight="bold"), corner_radius=6,
             command=self._send)
         self.send_btn.grid(row=0, column=1, padx=(0, 10), pady=8)
 
@@ -2085,7 +2133,7 @@ class NotesRetrieverTab:
         search_entry = ctk.CTkEntry(
             popup, textvariable=search_var, placeholder_text="Type to filter...",
             fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6, height=32)
+            font=_font(), corner_radius=6, height=32)
         search_entry.pack(fill=tk.X, padx=8, pady=(8, 4))
         search_entry.focus()
 
@@ -2564,14 +2612,14 @@ class CustomerResearchTab:
         top.pack(fill=tk.X, padx=16, pady=(14, 6))
 
         ctk.CTkLabel(top, text="🌐  Customer Research",
-                     font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                     font=_font(size=15, weight="bold"),
                      text_color=FG_BRIGHT).pack(side=tk.LEFT)
 
         ctk.CTkButton(
             top, text="＋ New Chat", width=110, height=30,
             fg_color=GREEN, hover_color=GREEN_HOVER, text_color=BG_DARK,
             border_width=0, corner_radius=6,
-            font=ctk.CTkFont("Segoe UI", 11, "bold"),
+            font=_font(weight="bold"),
             command=self._new_chat).pack(side=tk.RIGHT, padx=(8, 0))
 
         # Body: sidebar + chat + brief panel
@@ -2591,11 +2639,11 @@ class CustomerResearchTab:
         sh_header = ctk.CTkFrame(sidebar, fg_color="transparent")
         sh_header.pack(fill=tk.X, padx=10, pady=(10, 4))
         ctk.CTkLabel(sh_header, text="🕘 History",
-                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     font=_font(size=12, weight="bold"),
                      text_color=ACCENT).pack(side=tk.LEFT)
         ctk.CTkButton(sh_header, text="⟳", width=28, height=24,
                       fg_color="transparent", hover_color=BG_INPUT,
-                      text_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
+                      text_color=ACCENT, font=_font(size=12),
                       command=lambda: threading.Thread(
                           target=self._load_session_history, daemon=True).start()
                       ).pack(side=tk.RIGHT)
@@ -2619,7 +2667,7 @@ class CustomerResearchTab:
         ctk.CTkButton(sh_btn_row, text="🗑 Delete", width=90, height=26,
                       fg_color=BG_INPUT, hover_color=RED, text_color=FG_BRIGHT,
                       border_width=1, border_color=BORDER, corner_radius=6,
-                      font=ctk.CTkFont("Segoe UI", 10),
+                      font=_font(size=10),
                       command=self._delete_selected_session).pack(side=tk.LEFT)
 
         # Main chat area
@@ -2632,7 +2680,7 @@ class CustomerResearchTab:
         prompts_frame = ctk.CTkFrame(main, fg_color="transparent")
         prompts_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ctk.CTkLabel(prompts_frame, text="Suggestions:",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.LEFT)
+                     text_color=FG_DIM, font=_font(size=10)).pack(side=tk.LEFT)
         for prompt in [
             "What does this company do?",
             "Recent news and funding",
@@ -2643,7 +2691,7 @@ class CustomerResearchTab:
                 prompts_frame, text=prompt, height=24,
                 fg_color=BG_CARD, hover_color=ACCENT, text_color=FG_BRIGHT,
                 border_width=1, border_color=BORDER, corner_radius=12,
-                font=ctk.CTkFont("Segoe UI", 10),
+                font=_font(size=10),
                 command=lambda p=prompt: self._use_suggestion(p)
             ).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -2658,15 +2706,15 @@ class CustomerResearchTab:
         chat_header = ctk.CTkFrame(chat_outer, fg_color="transparent")
         chat_header.grid(row=0, column=0, sticky="new", padx=12, pady=(10, 4))
         ctk.CTkLabel(chat_header, text="Chat",
-                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     font=_font(size=12, weight="bold"),
                      text_color=YELLOW).pack(side=tk.LEFT)
         self.turn_label = ctk.CTkLabel(
             chat_header, text="New conversation",
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10))
+            text_color=FG_DIM, font=_font(size=10))
         self.turn_label.pack(side=tk.LEFT, padx=(10, 0))
         ctk.CTkLabel(
             chat_header, text="🌐 Customer Research  ·  Claude Sonnet 4  ·  Web Search",
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10)).pack(side=tk.RIGHT)
+            text_color=FG_DIM, font=_font(size=10)).pack(side=tk.RIGHT)
 
         self.chat_text = StyledText(chat_outer, font=("Segoe UI", 10))
         self.chat_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=(32, 4))
@@ -2687,7 +2735,7 @@ class CustomerResearchTab:
         self.input_entry = ctk.CTkEntry(
             input_row, textvariable=self.input_var,
             fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
-            font=ctk.CTkFont("Segoe UI", 12), corner_radius=6,
+            font=_font(size=12), corner_radius=6,
             placeholder_text="Research a customer (e.g. 'What's new with Acme Corp?')...")
         self.input_entry.grid(row=0, column=0, sticky="ew", padx=(10, 6), pady=8)
         self.input_entry.bind("<Return>", lambda e: self._send())
@@ -2695,7 +2743,7 @@ class CustomerResearchTab:
         self.send_btn = ctk.CTkButton(
             input_row, text="Send ↵", width=90, height=36,
             fg_color=YELLOW, hover_color=YELLOW_HOVER, text_color=BG_DARK,
-            font=ctk.CTkFont("Segoe UI", 12, "bold"), corner_radius=6,
+            font=_font(size=12, weight="bold"), corner_radius=6,
             command=self._send)
         self.send_btn.grid(row=0, column=1, padx=(0, 10), pady=8)
 
@@ -2706,40 +2754,40 @@ class CustomerResearchTab:
         brief_panel.grid_propagate(False)
 
         ctk.CTkLabel(brief_panel, text="📄  Customer Brief",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
+                     font=_font(size=13, weight="bold"),
                      text_color=ACCENT).pack(anchor=tk.W, padx=12, pady=(12, 8))
 
         ctk.CTkLabel(brief_panel, text="Company Name:",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)
+                     text_color=FG_DIM, font=_font()
                      ).pack(anchor=tk.W, padx=12, pady=(4, 0))
         self.brief_company_var = tk.StringVar()
         ctk.CTkEntry(brief_panel, textvariable=self.brief_company_var, width=210,
                      fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
-                     font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+                     font=_font(), corner_radius=6,
                      placeholder_text="e.g. Denali Therapeutics"
                      ).pack(padx=12, pady=(2, 6))
 
         ctk.CTkLabel(brief_panel, text="Domain:",
-                     text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 11)
+                     text_color=FG_DIM, font=_font()
                      ).pack(anchor=tk.W, padx=12, pady=(0, 0))
         self.brief_domain_var = tk.StringVar()
         ctk.CTkEntry(brief_panel, textvariable=self.brief_domain_var, width=210,
                      fg_color=BG_INPUT, border_color=BORDER, text_color=FG_BRIGHT,
-                     font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+                     font=_font(), corner_radius=6,
                      placeholder_text="e.g. denalitherapeutics.com"
                      ).pack(padx=12, pady=(2, 8))
 
         self.brief_generate_btn = ctk.CTkButton(
             brief_panel, text="📄  Create Customer Brief", width=210, height=36,
             fg_color=GREEN, hover_color=GREEN_HOVER, text_color=BG_DARK,
-            font=ctk.CTkFont("Segoe UI", 12, "bold"), corner_radius=8,
+            font=_font(size=12, weight="bold"), corner_radius=8,
             command=self._generate_brief)
         self.brief_generate_btn.pack(padx=12, pady=(0, 8))
 
         self.brief_status_var = tk.StringVar(value="")
         self.brief_status_label = ctk.CTkLabel(
             brief_panel, textvariable=self.brief_status_var,
-            text_color=FG_DIM, font=ctk.CTkFont("Segoe UI", 10),
+            text_color=FG_DIM, font=_font(size=10),
             wraplength=210)
         self.brief_status_label.pack(padx=12, pady=(0, 8))
 
@@ -3135,20 +3183,20 @@ class InsightsTab:
         top.pack(fill=tk.X, padx=16, pady=(14, 6))
 
         ctk.CTkLabel(top, text="📊  Trends & Insights",
-                     font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                     font=_font(size=15, weight="bold"),
                      text_color=FG_BRIGHT).pack(side=tk.LEFT)
 
         ctk.CTkButton(
             top, text="⟳ Refresh", width=100, height=30,
             fg_color=BG_INPUT, hover_color=BG_CARD, text_color=ACCENT,
             border_width=1, border_color=BORDER, corner_radius=6,
-            font=ctk.CTkFont("Segoe UI", 11),
+            font=_font(),
             command=lambda: threading.Thread(target=self._refresh_data, daemon=True).start()
         ).pack(side=tk.RIGHT)
 
         self.status_label = ctk.CTkLabel(
             top, text="Loading...", text_color=FG_DIM,
-            font=ctk.CTkFont("Segoe UI", 10))
+            font=_font(size=10))
         self.status_label.pack(side=tk.RIGHT, padx=(0, 12))
 
         # Stats row
@@ -3186,14 +3234,22 @@ class InsightsTab:
         trend_header = ctk.CTkFrame(trend_panel, fg_color="transparent")
         trend_header.pack(fill=tk.X, padx=14, pady=(12, 8))
         ctk.CTkLabel(trend_header, text="🔮  Trend Generation",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
+                     font=_font(size=13, weight="bold"),
                      text_color=ACCENT).pack(side=tk.LEFT)
         self._trend_btn = ctk.CTkButton(
             trend_header, text="Generate Trends", width=130, height=30,
             fg_color=GREEN, hover_color=GREEN_HOVER, text_color=BG_DARK,
-            font=ctk.CTkFont("Segoe UI", 11, "bold"), corner_radius=6,
+            font=_font(weight="bold"), corner_radius=6,
             command=self._generate_trends)
         self._trend_btn.pack(side=tk.RIGHT)
+
+        self._trend_sift_btn = ctk.CTkButton(
+            trend_header, text="📊 SIFT", width=70, height=30,
+            fg_color="#1f2937", hover_color=ACCENT, text_color=FG_BRIGHT,
+            font=_font(size=10), corner_radius=6,
+            border_width=1, border_color="#374151", state=tk.DISABLED,
+            command=self._submit_trend_sift)
+        self._trend_sift_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
         self._trend_text = StyledText(trend_panel, font=("Segoe UI", 10))
         self._trend_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
@@ -3207,13 +3263,15 @@ class InsightsTab:
         # Colored accent line at top
         accent_bar = ctk.CTkFrame(card, fg_color=color, corner_radius=0, height=3)
         accent_bar.pack(fill=tk.X, padx=12, pady=(8, 0))
-        ctk.CTkLabel(card, text=str(value), font=ctk.CTkFont("Segoe UI", 24, "bold"),
+        ctk.CTkLabel(card, text=str(value), font=_font(size=24, weight="bold"),
                      text_color=color).pack(padx=12, pady=(4, 0))
-        ctk.CTkLabel(card, text=label, font=ctk.CTkFont("Segoe UI", 9),
+        ctk.CTkLabel(card, text=label, font=_font(size=9),
                      text_color=FG_DIM).pack(padx=12, pady=(0, 8))
 
     def _generate_trends(self):
         self._trend_btn.configure(state=tk.DISABLED, text="⏳ Analyzing...")
+        self._trend_sift_btn.configure(state=tk.DISABLED)
+        self._trend_cancelled = False
         self._trend_text.config(state=tk.NORMAL)
         self._trend_text.delete("1.0", tk.END)
         self._trend_text.insert(tk.END, "Scanning call history and note files...\n")
@@ -3323,35 +3381,86 @@ FORMATTING RULES:
         threading.Thread(target=run, daemon=True).start()
 
     def _trend_update_status(self, msg):
-        self._trend_text.config(state=tk.NORMAL)
-        self._trend_text.delete("1.0", tk.END)
-        self._trend_text.insert(tk.END, f"⏳ {msg}\n")
-        self._trend_text.config(state=tk.DISABLED)
+        if getattr(self, '_trend_cancelled', False):
+            return
+        try:
+            self._trend_text.config(state=tk.NORMAL)
+            self._trend_text.delete("1.0", tk.END)
+            self._trend_text.insert(tk.END, f"⏳ {msg}\n")
+            self._trend_text.config(state=tk.DISABLED)
+        except tk.TclError:
+            pass
 
     def _trend_append(self, text):
-        self._trend_text.config(state=tk.NORMAL)
-        if not self._trend_streaming_started:
-            self._trend_streaming_started = True
-            self._trend_text.delete("1.0", tk.END)
-        self._trend_md_streamer.feed(text)
-        if self._trend_text.yview()[1] >= 0.95:
-            self._trend_text.see(tk.END)
-        self._trend_text.config(state=tk.DISABLED)
+        if getattr(self, '_trend_cancelled', False):
+            return
+        try:
+            self._trend_text.config(state=tk.NORMAL)
+            if not self._trend_streaming_started:
+                self._trend_streaming_started = True
+                self._trend_text.delete("1.0", tk.END)
+            self._trend_md_streamer.feed(text)
+            if self._trend_text.yview()[1] >= 0.95:
+                self._trend_text.see(tk.END)
+            self._trend_text.config(state=tk.DISABLED)
+        except tk.TclError:
+            pass
 
     def _trend_finish(self):
-        self._trend_text.config(state=tk.NORMAL)
-        if hasattr(self, '_trend_md_streamer'):
-            self._trend_md_streamer.flush()
-        if self._trend_text.yview()[1] >= 0.95:
-            self._trend_text.see(tk.END)
-        self._trend_text.config(state=tk.DISABLED)
-        self._trend_btn.configure(state=tk.NORMAL, text="Generate Trends")
+        try:
+            self._trend_text.config(state=tk.NORMAL)
+            if hasattr(self, '_trend_md_streamer'):
+                self._trend_md_streamer.flush()
+            if self._trend_text.yview()[1] >= 0.95:
+                self._trend_text.see(tk.END)
+            self._trend_text.config(state=tk.DISABLED)
+            self._trend_btn.configure(state=tk.NORMAL, text="Generate Trends")
+            self._trend_sift_btn.configure(state=tk.NORMAL)
+        except tk.TclError:
+            pass
 
     def _trend_error(self, error):
-        self._trend_text.config(state=tk.NORMAL)
-        self._trend_text.insert(tk.END, f"\n⚠️ Error: {error}\n")
-        self._trend_text.config(state=tk.DISABLED)
-        self._trend_btn.configure(state=tk.NORMAL, text="Generate Trends")
+        try:
+            self._trend_text.config(state=tk.NORMAL)
+            self._trend_text.insert(tk.END, f"\n⚠️ Error: {error}\n")
+            self._trend_text.config(state=tk.DISABLED)
+            self._trend_btn.configure(state=tk.NORMAL, text="Generate Trends")
+        except tk.TclError:
+            pass
+
+    def _submit_trend_sift(self):
+        """Queue a SIFT insight from the generated trend analysis."""
+        trend_content = self._trend_text.get("1.0", tk.END).strip()
+        if not trend_content or trend_content.startswith("⏳"):
+            from tkinter import messagebox
+            messagebox.showinfo("No Trends", "Generate trends first before submitting to SIFT.")
+            return
+
+        self._trend_sift_btn.configure(state=tk.DISABLED, text="📊 Extracting...")
+
+        def _flash_btn(text, color):
+            self._trend_sift_btn.configure(text=text, fg_color=color, state=tk.DISABLED)
+            self._parent.after(3000, lambda: self._trend_sift_btn.configure(
+                state=tk.NORMAL, text="📊 SIFT", fg_color="#1f2937"))
+
+        def _run():
+            try:
+                from transcription.sift_insight import queue_sift_trend_insight
+                path = queue_sift_trend_insight(trend_content)
+                if path == "DUPLICATE":
+                    self._parent.after(0, lambda: _flash_btn("⚠️ Duplicate", "#92400e"))
+                    return
+                if not path:
+                    self._parent.after(0, lambda: _flash_btn("❌ Failed", "#7f1d1d"))
+                    return
+                self._parent.after(0, lambda: _flash_btn("✅ Queued", "#065f46"))
+                self._parent.after(0, lambda: show_toast(
+                    self._parent, "📊 Cross-customer SIFT insight queued"))
+            except Exception as e:
+                print(f"[sift-trends] Error: {e}")
+                self._parent.after(0, lambda: _flash_btn("❌ Error", "#7f1d1d"))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _refresh_data(self):
         try:
@@ -3433,10 +3542,12 @@ FORMATTING RULES:
         comp_count = len(comp_summary) if comp_summary else 0
         self._make_stat_card(self._stats_frame, "Competitors", comp_count, "#ef4444")
 
-        # Clear chart frames
+        # Clear chart frames — close old matplotlib figures to free GDI handles
         for frame in self._chart_frames:
             for w in frame.winfo_children():
                 w.destroy()
+        import matplotlib.pyplot as plt
+        plt.close('all')
 
         def embed_chart(frame, fig):
             canvas = FigureCanvasTkAgg(fig, master=frame)
@@ -3581,7 +3692,7 @@ def main():
         top_bar, text="☀️ Light", width=80, height=28,
         fg_color=BG_INPUT, hover_color=BG_CARD, text_color=ACCENT,
         border_width=1, border_color=BORDER, corner_radius=6,
-        font=ctk.CTkFont("Segoe UI", 11), command=toggle_theme)
+        font=_font(), command=toggle_theme)
     theme_btn.pack(side=tk.RIGHT)
 
     # Tab container

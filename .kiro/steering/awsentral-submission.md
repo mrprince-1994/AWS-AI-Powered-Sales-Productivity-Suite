@@ -1,5 +1,5 @@
 ---
-inclusion: auto
+inclusion: manual
 description: Conventions for end-of-day AWSentral submission (activities, SIFT, opportunity updates)
 ---
 

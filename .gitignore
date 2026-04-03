@@ -61,7 +61,9 @@ call_notes_app/build_style_guide.py
 
 # Internal Amazon-specific hooks (multi-agent routing)
 .kiro/hooks/route-chat-specialist.kiro.hook
+.kiro/hooks/route-chat-specialist.kiro.hook.disabled
 .kiro/hooks/route-specialist-check.kiro.hook
+.kiro/hooks/route-specialist-check.kiro.hook.disabled
 
 # Kiro specs (local development artifacts)
 .kiro/specs/
@@ -86,3 +88,9 @@ call_notes_app/transcription/test_meeting_assistant.py
 
 # Weekly digest (internal Amazon)
 call_notes_app/weekly_digest.py
+
+# Midway refresh script (Windows-specific, internal Amazon auth)
+call_notes_app/refresh_midway.ps1
+
+# Test files (internal debugging)
+call_notes_app/transcription/test_transcriber.py

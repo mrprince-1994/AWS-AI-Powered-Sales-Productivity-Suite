@@ -1,6 +1,5 @@
 import asyncio
 import threading
-import struct
 import numpy as np
 import sounddevice as sd
 from amazon_transcribe.client import TranscribeStreamingClient
@@ -12,12 +11,16 @@ from config import SAMPLE_RATE, CHANNELS, AWS_REGION
 class _TranscriptHandler(TranscriptResultStreamHandler):
     """Handles streaming transcript events from Amazon Transcribe."""
 
-    def __init__(self, stream, on_partial, on_final):
+    # Channel ID mapping: ch_0 = system audio (customer), ch_1 = mic (you)
+    _CHANNEL_LABELS = {"ch_0": "Customer", "ch_1": "You"}
+
+    def __init__(self, stream, on_partial, on_final, dual_channel=False):
         super().__init__(stream)
         self.on_partial = on_partial
         self.on_final = on_final
         self.full_transcript = []
         self._last_speaker = None
+        self._dual_channel = dual_channel
 
     async def handle_transcript_event(self, transcript_event: TranscriptEvent):
         results = transcript_event.transcript.results
@@ -29,9 +32,11 @@ class _TranscriptHandler(TranscriptResultStreamHandler):
             if not text:
                 continue
 
-            # Extract speaker label from items
+            # Determine speaker label
             speaker = None
-            if alt.items:
+            if self._dual_channel and hasattr(result, "channel_id") and result.channel_id:
+                speaker = self._CHANNEL_LABELS.get(result.channel_id, result.channel_id)
+            elif alt.items:
                 for item in alt.items:
                     if item.speaker:
                         speaker = item.speaker
@@ -103,8 +108,16 @@ class LiveTranscriber:
         except Exception as e:
             print(f"Mic audio callback error: {e}")
 
-    def _get_mixed_chunk(self, num_samples):
-        """Extract and mix audio from both buffers. Returns PCM16 bytes or None."""
+    def _is_dual_channel(self):
+        """True when both system and mic devices are active."""
+        return self.system_device is not None and self.mic_device is not None
+
+    def _get_audio_chunk(self, num_samples):
+        """Return PCM16 bytes for Transcribe, or None if not enough data.
+
+        Dual-channel (both devices): interleaved stereo — ch_0 = system, ch_1 = mic.
+        Single device: mono PCM16.
+        """
         has_system = self.system_device is not None
         has_mic = self.mic_device is not None
 
@@ -124,19 +137,29 @@ class LiveTranscriber:
                 mic_chunk = self._mic_buffer[:num_samples]
                 self._system_buffer = self._system_buffer[num_samples:]
                 self._mic_buffer = self._mic_buffer[num_samples:]
-                mixed = (sys_chunk + mic_chunk) / 2.0
+
+                # Clip each channel independently
+                sys_chunk = np.clip(sys_chunk, -1.0, 1.0)
+                mic_chunk = np.clip(mic_chunk, -1.0, 1.0)
+
+                # Interleave as stereo: [sys0, mic0, sys1, mic1, ...]
+                stereo = np.empty(num_samples * 2, dtype=np.float32)
+                stereo[0::2] = sys_chunk
+                stereo[1::2] = mic_chunk
+                pcm16 = (stereo * 32767).astype(np.int16)
+                return pcm16.tobytes()
             elif has_system:
-                mixed = self._system_buffer[:num_samples]
+                mono = self._system_buffer[:num_samples]
                 self._system_buffer = self._system_buffer[num_samples:]
             else:
-                mixed = self._mic_buffer[:num_samples]
+                mono = self._mic_buffer[:num_samples]
                 self._mic_buffer = self._mic_buffer[num_samples:]
 
-        # Convert float32 [-1.0, 1.0] to PCM16 bytes
-        peak = np.max(np.abs(mixed))
+        # Single-channel path
+        peak = np.max(np.abs(mono))
         if peak > 1.0:
-            mixed = mixed / peak
-        pcm16 = (mixed * 32767).astype(np.int16)
+            mono = mono / peak
+        pcm16 = (mono * 32767).astype(np.int16)
         return pcm16.tobytes()
 
     async def _stream_audio(self, transcribe_stream):
@@ -145,7 +168,7 @@ class LiveTranscriber:
         chunk_samples = SAMPLE_RATE // 10
 
         while self._running:
-            audio_bytes = self._get_mixed_chunk(chunk_samples)
+            audio_bytes = self._get_audio_chunk(chunk_samples)
             if audio_bytes:
                 await transcribe_stream.input_stream.send_audio_event(
                     audio_chunk=audio_bytes
@@ -158,15 +181,36 @@ class LiveTranscriber:
     async def _run_transcription(self):
         """Main async loop: connect to Transcribe and stream audio."""
         client = TranscribeStreamingClient(region=AWS_REGION)
+        dual = self._is_dual_channel()
 
-        stream = await client.start_stream_transcription(
-            language_code="en-US",
-            media_sample_rate_hz=SAMPLE_RATE,
-            media_encoding="pcm",
-            show_speaker_label=True,
+        if dual:
+            # Dual-channel: each device gets its own channel, Transcribe
+            # transcribes them independently.  Cannot combine with
+            # show_speaker_label (API constraint).
+            stream = await client.start_stream_transcription(
+                language_code="en-US",
+                media_sample_rate_hz=SAMPLE_RATE,
+                media_encoding="pcm",
+                enable_channel_identification=True,
+                number_of_channels=2,
+                enable_partial_results_stabilization=True,
+                partial_results_stability="high",
+            )
+        else:
+            # Single device — fall back to speaker diarization
+            stream = await client.start_stream_transcription(
+                language_code="en-US",
+                media_sample_rate_hz=SAMPLE_RATE,
+                media_encoding="pcm",
+                show_speaker_label=True,
+                enable_partial_results_stabilization=True,
+                partial_results_stability="high",
+            )
+
+        self._handler = _TranscriptHandler(
+            stream.output_stream, self.on_partial, self.on_final,
+            dual_channel=dual,
         )
-
-        self._handler = _TranscriptHandler(stream.output_stream, self.on_partial, self.on_final)
 
         await asyncio.gather(
             self._stream_audio(stream),

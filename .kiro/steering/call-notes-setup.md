@@ -1,5 +1,5 @@
 ---
-inclusion: auto
+inclusion: manual
 description: Setup guide for the Call Notes desktop application
 ---
 
